@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xauditor-coder-service"
+version = "1.0.0"
+description = "HTTP microservice that wraps the Claude Code CLI for xauditor's repo-global verification stage."
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.110",
+    "pydantic>=2.0",
+    "uvicorn[standard]>=0.27",
+    # The xauditor helpers we used to import (parse_coder_response,
+    # scrub_environment, build_cli_argv, CODER_STATUS_*) are now vendored
+    # under xauditor_coder_service/_vendored.py — no runtime dep on
+    # xauditor itself. Drift is asserted by
+    # tests/test_coder_service_vendor_drift.py in the xauditor repo.
+]
+
+[project.scripts]
+xauditor-coder-service = "xauditor_coder_service.__main__:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+# Ship the Dockerfile and runtime requirements inside the wheel itself,
+# mirroring xauditor-portal's pattern. The xauditor-side `coder build`
+# verb resolves these via xauditor_coder_service.__file__ so the docker
+# build context is the installed package directory — no external wheel
+# files, no operator-side staging.
+"xauditor_coder_service" = [
+    ".dockerignore",
+    "docker/Dockerfile",
+    "docker/requirements.txt",
+]

@@ -1,0 +1,13 @@
+# Frontend image context.
+node_modules
+.next
+out
+.git
+.gitignore
+.env
+.env.*
+npm-debug.log*
+README.md
+coverage
+tests
+vitest.config.ts

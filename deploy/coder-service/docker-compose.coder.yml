@@ -1,0 +1,89 @@
+# Local sidecar for the xauditor coder microservice.
+#
+# Bring up:    docker compose -f deploy/coder-service/docker-compose.coder.yml up -d
+# Tear down:   docker compose -f deploy/coder-service/docker-compose.coder.yml down
+#
+# After the sidecar is running, configure xauditor:
+#
+#   coder:
+#     enabled: true
+#     transport: http
+#     endpoint: unix:///var/run/xauditor-coder/xauditor-coder.sock
+#
+# When you set XAUDITOR_CODER_SERVICE_TOKEN in your shell, also flip
+# coder.enable_auth: true and coder.endpoint_token to the same value.
+
+services:
+  coder:
+    image: xauditor-coder-service:local
+    container_name: xauditor-coder-service
+    restart: unless-stopped
+    # Loopback-only TCP by default; switch to a unix socket below if you
+    # prefer kernel socket permissions over bearer-token auth.
+    environment:
+      XAUDITOR_CODER_SERVICE_BIND: "0.0.0.0:8090"
+      XAUDITOR_CODER_SERVICE_MAX_CONCURRENT: "4"
+      XAUDITOR_CODER_SERVICE_JOB_TTL_SECONDS: "3600"
+      # Auth is disabled by default. To enable, uncomment both lines AND
+      # set the same token on the xauditor side:
+      # XAUDITOR_CODER_SERVICE_ENABLE_AUTH: "true"
+      # XAUDITOR_CODER_SERVICE_TOKEN: "${XAUDITOR_CODER_TOKEN:?XAUDITOR_CODER_TOKEN must be set}"
+      # Claude Code reads ANTHROPIC_API_KEY from the env. Forwarding from
+      # the host shell is the simplest path; leave unset if you set
+      # coder.model_api_key per-request from xauditor instead.
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+    ports:
+      # Loopback-only by design: only the host xauditor can reach it.
+      - "127.0.0.1:8090:8090"
+    volumes:
+      # Multi-project workspace (since the multi-project-coder-service
+      # change). Mount a parent directory whose direct child
+      # subdirectories ARE the audit-able projects. Adding a new project
+      # is `mkdir + git clone` on the host with no container restart.
+      # Override CODER_WORKSPACE_ROOT in your shell, or fall back to the
+      # current working directory for the legacy single-repo flow.
+      - "${CODER_WORKSPACE_ROOT:-${PWD}}:/workspace:ro"
+      # Persist per-project claude session caches / MCP server state so
+      # ``HOME=/home/coder/<project>`` survives container restarts.
+      - "xauditor-coder-home:/home/coder"
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - "no-new-privileges:true"
+    healthcheck:
+      test: ["CMD", "curl", "--silent", "--fail", "http://127.0.0.1:8090/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+# To use a unix socket instead of TCP (recommended for same-host setups
+# where you want to skip token plumbing), replace the `services.coder`
+# block with:
+#
+# services:
+#   coder:
+#     image: xauditor-coder-service:local
+#     environment:
+#       XAUDITOR_CODER_SERVICE_BIND: "unix:/run/xauditor-coder/xauditor-coder.sock"
+#     volumes:
+#       - "${CODER_WORKSPACE_ROOT:-${PWD}}:/workspace:ro"
+#       - "xauditor-coder-home:/home/coder"
+#       - "/var/run/xauditor-coder:/run/xauditor-coder"
+#     read_only: true
+#     tmpfs:
+#       - /tmp
+#     cap_drop: [ALL]
+#
+# Then on the xauditor side:
+#
+#   coder:
+#     transport: http
+#     endpoint: unix:///var/run/xauditor-coder/xauditor-coder.sock
+
+volumes:
+  xauditor-coder-home:
+    name: xauditor-coder-home

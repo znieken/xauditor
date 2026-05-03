@@ -1,0 +1,33 @@
+include alembic.ini
+include README.md
+
+recursive-include src/xauditor_portal/docker *
+recursive-include src/xauditor_portal/db/migrations *.py *.mako
+
+# Frontend tree — explicit grafts of authored subdirectories only, so the
+# sdist build never has to walk node_modules / .next / build caches just to
+# prune them back out. Adding a new top-level frontend subdir means adding a
+# graft line here.
+graft src/xauditor_portal/frontend/app
+graft src/xauditor_portal/frontend/components
+graft src/xauditor_portal/frontend/lib
+graft src/xauditor_portal/frontend/public
+graft src/xauditor_portal/frontend/tests
+include src/xauditor_portal/frontend/Dockerfile
+include src/xauditor_portal/frontend/*.json
+include src/xauditor_portal/frontend/*.mjs
+include src/xauditor_portal/frontend/*.ts
+include src/xauditor_portal/frontend/*.tsx
+
+# Hidden files setuptools globs miss by default.
+include src/xauditor_portal/.dockerignore
+include src/xauditor_portal/frontend/.dockerignore
+include src/xauditor_portal/frontend/.gitkeep
+include src/xauditor_portal/components/.gitkeep
+
+# Build artifacts and caches never ship.
+global-exclude __pycache__
+global-exclude *.py[cod]
+global-exclude *.tsbuildinfo
+prune src/xauditor_portal/frontend/node_modules
+prune src/xauditor_portal/frontend/.next

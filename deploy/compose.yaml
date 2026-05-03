@@ -1,0 +1,194 @@
+# deploy/compose.yaml
+#
+# Self-hosted xauditor stack for remote-server deployment. Brings up Neo4j,
+# Postgres (report DB), portal backend, portal frontend, an internal PyPI
+# index, and a static HTTP host serving the analyst install script.
+#
+# Every tunable is driven by `deploy/.env` (copy `deploy/.env.example`). The
+# two passwords (`NEO4J_PASSWORD`, `REPORTDB_PASSWORD`) have NO defaults —
+# compose will refuse to start until you set them.
+#
+# Bring up: `docker compose -f deploy/compose.yaml up -d --build`
+# Tear down (keep volumes): `docker compose -f deploy/compose.yaml down`
+# Tear down + wipe data:    `docker compose -f deploy/compose.yaml down -v`
+#
+# See deploy/README.md for the full operator and analyst workflows.
+
+services:
+  neo4j:
+    image: ${NEO4J_IMAGE:-neo4j:5-community}
+    container_name: xauditor-neo4j
+    restart: unless-stopped
+    environment:
+      NEO4J_AUTH: ${NEO4J_USER:-neo4j}/${NEO4J_PASSWORD:?NEO4J_PASSWORD is required in deploy/.env}
+      # The `neo4j:5-community` image does NOT set NEO4J_USER /
+      # NEO4J_PASSWORD as separate env vars — only NEO4J_AUTH. Expose the
+      # values under non-`NEO4J_`-prefixed names so the healthcheck can
+      # read them without colliding with Neo4j's own `NEO4J_*` config
+      # convention.
+      _PROBE_USER: ${NEO4J_USER:-neo4j}
+      _PROBE_PASSWORD: ${NEO4J_PASSWORD}
+    ports:
+      - "${NEO4J_BIND_ADDR:-0.0.0.0}:${NEO4J_BOLT_PORT:-7687}:7687"
+      - "${NEO4J_BIND_ADDR:-0.0.0.0}:${NEO4J_HTTP_PORT:-7474}:7474"
+    volumes:
+      - neo4j-data:/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - cypher-shell -a bolt://127.0.0.1:7687 -u "$${_PROBE_USER}" -p "$${_PROBE_PASSWORD}" 'RETURN 1'
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 60s
+
+  reportdb:
+    image: ${REPORTDB_IMAGE:-postgres:16-alpine}
+    container_name: xauditor-reportdb
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${REPORTDB_USER:-xauditor}
+      POSTGRES_PASSWORD: ${REPORTDB_PASSWORD:?REPORTDB_PASSWORD is required in deploy/.env}
+      POSTGRES_DB: ${REPORTDB_DATABASE:-xauditor_reportdb}
+    ports:
+      - "${REPORTDB_BIND_ADDR:-0.0.0.0}:${REPORTDB_PORT:-5432}:5432"
+    volumes:
+      - reportdb-data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  portal-backend:
+    # Build from the xauditor-portal wheel that the operator drops into
+    # `deploy/packages/`. `PORTAL_WHEEL` in deploy/.env names the exact
+    # wheel filename (e.g. xauditor_portal-0.2.3-py3-none-any.whl).
+    # Override `PORTAL_BACKEND_IMAGE` to pull a registry tag and skip the
+    # local build entirely.
+    build:
+      context: .
+      dockerfile: portal/backend.Dockerfile
+      args:
+        PORTAL_WHEEL: ${PORTAL_WHEEL:?PORTAL_WHEEL is required in deploy/.env (exact xauditor_portal wheel filename)}
+    image: ${PORTAL_BACKEND_IMAGE:-xauditor-portal-backend:local}
+    container_name: xauditor-portal-backend
+    restart: unless-stopped
+    depends_on:
+      reportdb:
+        condition: service_healthy
+    environment:
+      XAUDITOR_PORTAL_DATABASE_URL: postgresql+asyncpg://${REPORTDB_USER:-xauditor}:${REPORTDB_PASSWORD}@xauditor-reportdb:5432/${REPORTDB_DATABASE:-xauditor_reportdb}
+    healthcheck:
+      # Use 127.0.0.1 to sidestep any dual-stack `localhost` resolution.
+      test:
+        - CMD-SHELL
+        - python -c 'import urllib.request; urllib.request.urlopen("http://127.0.0.1:8000/api/health").read()'
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+
+  portal-frontend:
+    # Same wheel-driven build as portal-backend: extract the frontend
+    # tree (shipped as package-data) from the wheel, run Next.js build,
+    # ship the standalone bundle.
+    build:
+      context: .
+      dockerfile: portal/frontend.Dockerfile
+      args:
+        PORTAL_WHEEL: ${PORTAL_WHEEL:?PORTAL_WHEEL is required in deploy/.env (exact xauditor_portal wheel filename)}
+    image: ${PORTAL_FRONTEND_IMAGE:-xauditor-portal-frontend:local}
+    container_name: xauditor-portal-frontend
+    restart: unless-stopped
+    depends_on:
+      portal-backend:
+        condition: service_healthy
+    environment:
+      BACKEND_INTERNAL_URL: http://xauditor-portal-backend:8000
+    ports:
+      - "${PORTAL_BIND_ADDR:-0.0.0.0}:${PORTAL_HOST_PORT:-8080}:3000"
+    healthcheck:
+      # `node:20-slim` ships neither `wget` nor `curl`, so probe with node's
+      # built-in http module against `/login` (public, always 200). `/` is
+      # not safe to probe: Next.js's server-component `redirect()` returns
+      # 307 but omits the HTTP `Location` header (the navigation target
+      # lives in the RSC flight payload), which any plain HTTP client —
+      # including Docker's healthcheck — misinterprets. Browsers handle
+      # the RSC path fine.
+      test:
+        - CMD-SHELL
+        - |-
+          node -e "require('http').get('http://127.0.0.1:3000/login', r => process.exit(r.statusCode<400?0:1)).on('error', () => process.exit(1))"
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  pypi:
+    # PEP 503-compatible index serving wheels/sdists out of a host bind mount.
+    # Drop new `.whl` / `.tar.gz` files into ${PYPI_DATA_DIR} — pypiserver
+    # rescans on every request, so no restart is needed to publish.
+    # Anonymous read+write is the default; put a VPN or a reverse proxy with
+    # auth in front if the stack is reachable from the public internet.
+    image: ${PYPI_IMAGE:-pypiserver/pypiserver:v2.1.1}
+    container_name: xauditor-pypi
+    restart: unless-stopped
+    command:
+      - run
+      - -v
+      - --disable-fallback
+      - --hash-algo
+      - sha256
+      - -a
+      - "."
+      - -P
+      - "."
+      - /data/packages
+    volumes:
+      # `./packages` is also the build context for portal-backend and
+      # portal-frontend; keeping it fixed ensures the wheel the operator
+      # drops here is the same wheel the portal containers are built from.
+      - ./packages:/data/packages
+    ports:
+      - "${PYPI_BIND_ADDR:-0.0.0.0}:${PYPI_HOST_PORT:-8081}:8080"
+    healthcheck:
+      # pypiserver listens on IPv4 0.0.0.0; Alpine resolves `localhost`
+      # to IPv6 `[::1]` first, which is not listening. Probe 127.0.0.1
+      # explicitly to avoid the dual-stack name-resolution mismatch.
+      test:
+        - CMD-SHELL
+        - wget -q --spider http://127.0.0.1:8080/simple/
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  install-server:
+    # Plain nginx serving the operator-supplied bootstrap directory. The file
+    # ${INSTALL_DATA_DIR}/install.sh is what analysts curl|bash.
+    image: ${INSTALL_IMAGE:-nginx:1.27-alpine}
+    container_name: xauditor-install-server
+    restart: unless-stopped
+    volumes:
+      - ${INSTALL_DATA_DIR:-./install}:/usr/share/nginx/html:ro
+    ports:
+      - "${INSTALL_BIND_ADDR:-0.0.0.0}:${INSTALL_HOST_PORT:-8082}:80"
+    healthcheck:
+      # Same `localhost -> IPv6` caveat as pypi — probe 127.0.0.1.
+      test:
+        - CMD-SHELL
+        - wget -q --spider http://127.0.0.1/install.sh
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+volumes:
+  neo4j-data:
+    name: xauditor-neo4j-data
+  reportdb-data:
+    name: xauditor-reportdb-data

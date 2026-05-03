@@ -1,0 +1,16 @@
+# Keep the docker build context lean — drop bytecode, caches, and dist
+# artefacts. We deliberately KEEP the docker/ subtree in the context
+# because the Dockerfile itself does ``COPY docker/requirements.txt …``
+# before the package-tree copy. The Dockerfile and requirements file
+# end up at /app/xauditor_coder_service/docker/ inside the image; that
+# is harmless and saves us from juggling exclusion rules.
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+.coverage
+.tox/
+.venv/

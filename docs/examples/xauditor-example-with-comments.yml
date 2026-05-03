@@ -1,0 +1,196 @@
+# Example xauditor.yml — comprehensive configuration covering portal,
+# coder verification, audit parallelism, and provider variants.
+#
+# Every block is optional. Omit what you don't need; the defaults kick in.
+# For the full configuration reference see docs/configuration.md and
+# docs/providers.md.
+
+# ---------------------------------------------------------------------------
+# Runtime + repository scope
+# ---------------------------------------------------------------------------
+runtime:
+  root_dir: .xauditor
+
+repository:
+  excludes:
+    - .venv
+    - node_modules
+    - vendor
+
+logging:
+  level: info
+  # file: /tmp/xauditor.log  # uncomment to mirror logs to a file
+
+# ---------------------------------------------------------------------------
+# Graph database — local managed container is the default.
+# Set `graph.db.remote.url` to point at an external Neo4j; xauditor will
+# skip container lifecycle management for that database.
+# ---------------------------------------------------------------------------
+graph:
+  db:
+    password: change-me
+    # remote:
+    #   url: neo4j+s://graph.example.com:7687
+    #   ssl_ca: /etc/ssl/neo4j-ca.pem
+    #   pool_size: 10
+  build:
+    enable_llm_enrichment: false
+    # neo4j_chunk_size: 5000          # default 5000, clamped [100, 50000]
+
+# ---------------------------------------------------------------------------
+# Report database (portal data mirror) — local managed container is default.
+# Only the `remote` block can carry credentials — the UI cannot edit them.
+# ---------------------------------------------------------------------------
+reportdb:
+  # image: postgres:16-alpine              # override if you need a pinned image
+  # container_name: xauditor-reportdb
+  # port: 5432
+  # database: xauditor_reportdb
+  # password: change-me
+  # remote:
+  #   url: postgresql+asyncpg://auditor:pass@reportdb.example.com:5432/xauditor
+  #   ssl_ca: /etc/ssl/pg-ca.pem
+  #   pool_size: 10
+
+# ---------------------------------------------------------------------------
+# Portal runtime — two-container topology. Defaults shown for reference.
+# ---------------------------------------------------------------------------
+portal:
+  network_name: xauditor-portal-net
+  host_port: 8080
+  expose_backend_on_localhost: false   # flip to true for local debugging only
+  # backend:
+  #   container_name: xauditor-portal-backend
+  #   image: xauditor-portal-backend:local
+  # frontend:
+  #   container_name: xauditor-portal-frontend
+  #   image: xauditor-portal-frontend:local
+
+# ---------------------------------------------------------------------------
+# LLM providers — values here are authoritative. UI edits cannot set api_key.
+#
+# Each provider declares a wire protocol via `kind`:
+#   - `kind: openai` (default)  — OpenAI-compat REST (OpenAI, vLLM, Together,
+#                                  Ollama-compat, Anthropic OpenAI shim, etc.)
+#   - `kind: anthropic`         — native Anthropic API
+# ---------------------------------------------------------------------------
+llm:
+  default_provider: shared
+  providers:
+    # OpenAI-compatible (kind defaults to openai when omitted)
+    shared:
+      base_url: https://your-openai-compatible-endpoint/v1
+      api_key: your-api-key
+      model_name: your-default-model
+      temperature: 0
+      top_p: 1
+      # top_k: 40                   # routes via extra_body for vLLM-style endpoints
+      # repetition_penalty: 1.05    # routes via extra_body; ignored by api.openai.com
+
+    # Specialised OpenAI-compatible provider with extended thinking
+    graph_specialist:
+      base_url: https://your-openai-compatible-endpoint/v1
+      api_key: your-graph-api-key
+      model_name: your-graph-model
+      thinking_enabled: true
+
+    # Native Anthropic API (commented; uncomment if you use api.anthropic.com)
+    # anthropic_native:
+    #   kind: anthropic
+    #   base_url: https://api.anthropic.com    # NOTE: no trailing /v1
+    #   api_key: sk-ant-...
+    #   model_name: claude-sonnet-4-7
+    #   thinking_effort: high                  # low | medium | high | xhigh | max
+    #   temperature: 0
+    #   top_k: 64
+    #   top_p: 0.95
+
+agents:
+  graph_builder:
+    llm:
+      provider: graph_specialist
+  auditor:
+    llm:
+      provider: shared
+      # temperature: 0.4              # per-agent override; overlays provider sampling
+  validator:
+    llm:
+      provider: shared
+      # temperature: 0                # deterministic validator example
+
+# ---------------------------------------------------------------------------
+# Audit parallelism + cancellation budget.
+#
+# `worker_count`: 1 (default) = inline / sequential; >= 2 = subprocess pool
+# (1..16).
+#
+# `shutdown_timeout_seconds`: wall-clock budget after the first Ctrl+C (or
+# external `Delete run`) before xauditor escalates to forced shutdown of
+# every executor + SIGTERM/SIGKILL of every tracked subprocess. Press Ctrl+C
+# a second time to bypass the budget via `os._exit(130)`.
+#
+# `audit.coder.shutdown_timeout_seconds`: inner cap for the coder
+# dispatcher's drain. Keep it strictly less than the run-level budget so the
+# coder layer always finishes (or is forced) before the outer deadline; the
+# runtime emits a startup warning if `coder` >= run-level.
+# ---------------------------------------------------------------------------
+audit:
+  worker_count: 1
+  shutdown_timeout_seconds: 30                    # default 30, range [1, 600]
+  coder:
+    shutdown_timeout_seconds: 20                  # default 20, range [1, 600]
+
+# ---------------------------------------------------------------------------
+# Teaming mode — opt-in multi-subagent orchestration with validator debate.
+# ---------------------------------------------------------------------------
+teaming:
+  enabled: false
+  analyzer:
+    subagent_count: 1
+    provider_list: [shared]
+  validator:
+    subagent_count: 1
+    provider_list: [shared]
+    debate_rounds: 5
+  exploiter:
+    subagent_count: 1
+    provider_list: [shared]
+
+# ---------------------------------------------------------------------------
+# Coder verification — optional 4th agent (Claude Code) that re-reads the
+# whole repo against each finding.
+#
+# Two transports:
+#   - `subprocess` (default) — spawn `claude` directly on the host
+#   - `http`                  — long-lived containerised microservice
+#
+# Multi-project workspace (0.11.0+): set `coder.workspace_root` to a host
+# directory whose subdirectories at any depth ARE audit-able projects.
+# xauditor derives the project name as `repo_root` relative to
+# `workspace_root` (e.g. workspace=/home/user/ws + repo_root=/home/user/ws/team/repo
+# → project=team/repo). Falls back to basename(realpath(repo_root)) when
+# repo_root is outside workspace_root. Override via `coder.project_name`
+# only for genuine edge cases (worktrees pointing outside the workspace).
+# ---------------------------------------------------------------------------
+coder:
+  enabled: false                                 # default false; flip to true to enable
+  transport: http                                # subprocess | http
+  concurrency: 4                                  # max parallel verifications
+  thinking_effort: high                           # low | medium | high | xhigh | max
+  request_timeout_seconds: 1800
+
+  # Model knobs translate to ANTHROPIC_* env vars baked into the worker.
+  # NOTE: `model_url` points at the host, not /v1 — claude SDK appends
+  # /v1/messages itself. Setting "https://example/v1" produces 404s.
+  model_url: https://api.anthropic.com
+  model_name: claude-sonnet-4-7
+  model_api_key: sk-ant-...
+
+  # HTTP-transport-only knobs (uncomment when transport: http)
+  # workspace_root: /home/user/coder-workspace
+  # project_name: secmind                          # default = relpath(repo_root, workspace_root) → falls back to basename when outside
+  # endpoint: https://coder-pool.internal/         # default: unix://<runtime.root_dir>/coder.sock
+  # enable_auth: true
+  # endpoint_token: sk-coder-...
+  # poll_interval_seconds: 1.0
+  # preflight_timeout_seconds: 5

@@ -1,0 +1,34 @@
+.worktrees/
+
+# Python build / packaging artifacts
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+.eggs/
+.ruff_cache/
+# uv-build staging trees (e.g. ``xauditor-0.7.3/`` or
+# ``xauditor_portal-0.5.0/``) — sometimes left beside the
+# real source tree when an interrupted build doesn't clean up.
+xauditor-?.?.?/
+xauditor_portal-?.?.?/
+xauditor_report_store-?.?.?/
+.mypy_cache/
+.pytest_cache/
+
+# Runtime state
+.xauditor/
+
+# Node / Next.js
+node_modules/
+.next/
+out/
+
+# Self-hosted deployment (see deploy/README.md)
+deploy/.env
+deploy/packages/*
+!deploy/packages/.gitkeep
+deploy/install/*.log
+mypy.log
+lint.log

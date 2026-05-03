@@ -1,0 +1,43 @@
+"""`report` schema ORM models."""
+
+from xauditor_portal.db.models.report.tables import (  # noqa: F401
+    SCHEMA,
+    AnalyzerSubagentRecord,
+    AuditRun,
+    AuditRunAdminAction,
+    CoderFinding,
+    CoderFindingEvidence,
+    CoverageFile,
+    CoverageFunction,
+    CoverageModule,
+    ExploiterSubagentRecord,
+    Finding,
+    FindingSourceReference,
+    NoFindingPath,
+    PathRawOutput,
+    ProgressEvent,
+    ReferencedSymbol,
+    ValidatorDebate,
+    ValidatorSubagentRecord,
+)
+
+__all__ = [
+    "AnalyzerSubagentRecord",
+    "AuditRun",
+    "AuditRunAdminAction",
+    "CoderFinding",
+    "CoderFindingEvidence",
+    "CoverageFile",
+    "CoverageFunction",
+    "CoverageModule",
+    "ExploiterSubagentRecord",
+    "Finding",
+    "FindingSourceReference",
+    "NoFindingPath",
+    "PathRawOutput",
+    "ProgressEvent",
+    "ReferencedSymbol",
+    "SCHEMA",
+    "ValidatorDebate",
+    "ValidatorSubagentRecord",
+]

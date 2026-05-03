@@ -1,0 +1,65 @@
+graph:
+  db:
+    password: your_graphdb_password
+  build:
+    enable_llm_enrichment: false
+audit:
+  worker_count: 4
+llm:
+  default_provider: openai
+  providers:
+    openai:
+      base_url: https://api.openai.com/v1
+      api_key: sk-xxxxx
+      model_name: gpt-5.5
+      thinking_enabled: true
+      temperature: 0
+    openrouter:
+      base_url: https://api.openrouter.com/v1
+      api_key: sk-xxxxx
+      model_name: glm-5.1
+      thinking_enabled: true
+      temperature: 0
+agents:
+  graph_builder:
+    llm:
+      provider: openrouter
+  auditor:
+    llm:
+      provider: openai
+  validator:
+    llm:
+      provider: openai
+teaming:
+  enabled: true
+  analyzer:
+    subagent_count: 2
+    provider_list: [openai, openrouter]
+  validator:
+    subagent_count: 2
+    provider_list: [openai, openrouter]
+    debate_rounds: 5
+  exploiter:
+    subagent_count: 2
+    provider_list: [openai, openrouter]
+runtime:
+  root_dir: .xauditor
+logging:
+  level: info
+coder:
+  enabled: true    # default false
+  workspace_root: /home/xxx/gitlab
+  transport: http
+  endpoint: http://127.0.0.1:8090 
+  concurrency: 4                 # max parallel Claude Code subprocesses
+  thinking_effort: xhigh          # low | medium | high | xhigh | max — passed to the CLI when set
+  #model_url: https://api.anthropic.com  # optional override
+  #model_name: opus4.7   # optional override
+  #model_api_key: sk-xxxxx    # optional secret, injected as ANTHROPIC_API_KEY
+  request_timeout_seconds: 1800  # SIGTERM then SIGKILL after grace
+repository:
+  excludes:
+    - .venv
+    - node_modules
+    - vendors
+    - tests

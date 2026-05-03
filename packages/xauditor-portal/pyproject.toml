@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xauditor-portal"
+version = "1.0.0"
+description = "Web portal and PostgreSQL mirror for the xauditor CLI."
+requires-python = ">=3.12"
+dependencies = [
+    "alembic>=1.13",
+    "asyncpg>=0.29",
+    "bcrypt>=4",
+    "fastapi>=0.110",
+    "psycopg[binary]>=3.1",
+    "pydantic>=2",
+    "pydantic-settings>=2",
+    "pyjwt>=2.8",
+    "pyyaml>=6",
+    "sqlalchemy[asyncio]>=2.0",
+    "uvicorn[standard]>=0.29",
+]
+
+[project.scripts]
+xauditor-portal = "xauditor_portal.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"xauditor_portal" = [
+    ".dockerignore",
+    "db/migrations/script.py.mako",
+    "db/migrations/versions/*.py",
+    "docker/backend.Dockerfile",
+    "docker/requirements.txt",
+    "frontend/.dockerignore",
+    "frontend/.gitkeep",
+    "frontend/Dockerfile",
+    "frontend/*.json",
+    "frontend/*.mjs",
+    "frontend/*.ts",
+    "frontend/*.tsx",
+    "frontend/app/**/*",
+    "frontend/components/**/*",
+    "frontend/lib/**/*",
+    "frontend/public/**/*",
+]

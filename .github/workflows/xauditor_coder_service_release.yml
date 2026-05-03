@@ -1,0 +1,41 @@
+# Build and publish the `xauditor-coder-service` package to PyPI via Trusted Publishing.
+# PyPI project: xauditor-coder-service   (pyproject at packages/xauditor-coder-service/)
+# Trigger: push a tag like `xauditor-coder-service-v1.0.0`, or run manually from the Actions tab.
+# Filename is load-bearing: PyPI's trusted publisher entry pins this exact name.
+
+name: xauditor-coder-service release
+
+on:
+  push:
+    tags:
+      - 'xauditor-coder-service-v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write   # needed to create the GitHub Release
+  id-token: write   # required for PyPI Trusted Publishing (OIDC)
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build sdist + wheel
+        run: uv build packages/xauditor-coder-service --out-dir packages/xauditor-coder-service/dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: packages/xauditor-coder-service/dist/
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: packages/xauditor-coder-service/dist/*
+          generate_release_notes: true

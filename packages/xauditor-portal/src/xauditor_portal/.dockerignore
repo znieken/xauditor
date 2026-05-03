@@ -1,0 +1,18 @@
+# Backend image context. Keep Python source in; keep everything else out.
+frontend/
+**/__pycache__/
+**/*.pyc
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+.venv/
+venv/
+.env
+.env.*
+*.egg-info/
+build/
+dist/
+tests/
+docs/
+.git/
+.gitignore

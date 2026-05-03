@@ -1,0 +1,9 @@
+# Mirror of pyproject.toml [project.dependencies] for the
+# xauditor-coder-service container image. The Dockerfile installs from
+# this file rather than the wheel so the build context can be the bare
+# package source tree (no pyproject.toml shipped into the container).
+#
+# Keep this file in lock-step with packages/xauditor-coder-service/pyproject.toml.
+fastapi>=0.110
+pydantic>=2.0
+uvicorn[standard]>=0.27
