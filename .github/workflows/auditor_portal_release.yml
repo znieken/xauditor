@@ -1,6 +1,8 @@
 # Build and publish the `xauditor-portal` package to PyPI via Trusted Publishing.
 # PyPI project: xauditor-portal   (pyproject at packages/xauditor-portal/)
-# Trigger: push a tag like `xauditor-portal-v1.0.0`, or run manually from the Actions tab.
+# Trigger: push a tag like `v1.0.0`, or run manually from the Actions tab.
+# A single `v*` tag fires all three release workflows (xauditor / portal / coder-service)
+# — keep their pyproject versions in lockstep, or move to per-package tag prefixes.
 # Filename is load-bearing: PyPI's trusted publisher entry pins this exact name.
 #
 # Note: tools/build-portal.sh exists for *local* builds on slow filesystems
@@ -12,7 +14,7 @@ name: xauditor-portal release
 on:
   push:
     tags:
-      - 'xauditor-portal-v*'
+      - 'v*'
   workflow_dispatch:
 
 permissions:

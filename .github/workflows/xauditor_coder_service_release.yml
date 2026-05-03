@@ -1,6 +1,8 @@
 # Build and publish the `xauditor-coder-service` package to PyPI via Trusted Publishing.
 # PyPI project: xauditor-coder-service   (pyproject at packages/xauditor-coder-service/)
-# Trigger: push a tag like `xauditor-coder-service-v1.0.0`, or run manually from the Actions tab.
+# Trigger: push a tag like `v1.0.0`, or run manually from the Actions tab.
+# A single `v*` tag fires all three release workflows (xauditor / portal / coder-service)
+# — keep their pyproject versions in lockstep, or move to per-package tag prefixes.
 # Filename is load-bearing: PyPI's trusted publisher entry pins this exact name.
 
 name: xauditor-coder-service release
@@ -8,7 +10,7 @@ name: xauditor-coder-service release
 on:
   push:
     tags:
-      - 'xauditor-coder-service-v*'
+      - 'v*'
   workflow_dispatch:
 
 permissions:
