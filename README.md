@@ -26,6 +26,17 @@ Most static-analysis tools surface alerts. **xauditor's job is to make each aler
 
 Prereqs: Python 3.12+, Docker, ~2 GB free RAM, an LLM API key.
 
+> **Docker is required** — `xauditor init` brings up Neo4j + Postgres + the portal as containers, and the coder verification stage uses Docker too. Install Docker Engine for your platform from the [official docs](https://docs.docker.com/engine/install/), then add your user to the `docker` group so the CLI works **without `sudo`**:
+>
+> ```bash
+> sudo groupadd docker            # safe to skip if the group already exists
+> sudo usermod -aG docker $USER
+> newgrp docker                   # apply the new group in the current shell
+> docker run --rm hello-world     # verify: should succeed without sudo
+> ```
+>
+> If `docker run hello-world` still requires `sudo`, log out and back in (or reboot) so the group membership takes effect. On Docker Desktop (macOS / Windows) this step is unnecessary.
+
 ```bash
 # 1. Install
 pip install xauditor xauditor-portal xauditor-coder-service
@@ -71,6 +82,10 @@ Graph extraction dispatches through a `LanguageParser` registry at [`src/xaudito
 | Java | tree-sitter | `Outer.Inner.method` |
 | JavaScript (`.js` / `.jsx` / `.mjs` / `.cjs`) | tree-sitter | `Class.method` / bare function |
 | TypeScript (`.ts` / `.tsx`) | tree-sitter | `Class.method` / bare function |
+| Kotlin (`.kt` / `.kts`) | tree-sitter | `Class.method` / `Object.method` / bare function |
+| Lua (`.lua`) | tree-sitter | `Table.method` (dot or colon form) / bare function |
+| Rust (`.rs`) | tree-sitter | `Type.method` (from `impl` blocks) / bare function |
+| Swift (`.swift`) | tree-sitter | `Class.method` / bare function |
 
 Files whose language has no registered parser are still inventoried (coverage knows they exist) but contribute no functions / classes / calls. Unparseable files emit a warning and are skipped without aborting the build.
 

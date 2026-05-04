@@ -9,8 +9,16 @@ import tree_sitter_cpp as _tscpp
 import tree_sitter_go as _tsgo
 import tree_sitter_java as _tsjava
 import tree_sitter_javascript as _tsjs
+import tree_sitter_kotlin as _tskotlin
+import tree_sitter_lua as _tslua
+import tree_sitter_rust as _tsrust
+import tree_sitter_swift as _tsswift
 import tree_sitter_typescript as _tsts
 from tree_sitter import Language, Parser
+
+# tree-sitter-dart is not published on PyPI as of this writing, so the dart
+# extension stays LSP-only. If a maintained tree-sitter-dart package appears
+# upstream, add it here and register a `_DartParser` in `_PARSER_REGISTRY`.
 
 from xauditor.graph.canonical import DiscoveredFile
 
@@ -1239,10 +1247,482 @@ class _JsLikeParser:
         return None
 
 
+class _RustParser:
+    def __init__(self, ts_language: Language) -> None:
+        self._parser = Parser(ts_language)
+
+    def parse(self, file: DiscoveredFile, content: str) -> _ParsedFile:
+        source_bytes = content.encode("utf-8", errors="replace")
+        tree = self._parser.parse(source_bytes)
+        functions: list[_ParsedFunction] = []
+        calls: list[_ParsedCall] = []
+        for child in tree.root_node.named_children:
+            if child.type == "function_item":
+                fn = self._build_function(child, source_bytes, file, receiver_type=None)
+                if fn is not None:
+                    functions.append(fn)
+                    calls.extend(self._extract_calls(child, fn, source_bytes))
+            elif child.type == "impl_item":
+                receiver = self._impl_type(child, source_bytes)
+                body = child.child_by_field_name("body")
+                if body is None:
+                    continue
+                for member in body.named_children:
+                    if member.type != "function_item":
+                        continue
+                    fn = self._build_function(
+                        member, source_bytes, file, receiver_type=receiver
+                    )
+                    if fn is not None:
+                        functions.append(fn)
+                        calls.extend(self._extract_calls(member, fn, source_bytes))
+        return _ParsedFile(classes=(), functions=tuple(functions), calls=tuple(calls))
+
+    def _impl_type(self, node, source_bytes: bytes) -> str | None:
+        type_node = node.child_by_field_name("type")
+        if type_node is None:
+            return None
+        if type_node.type in ("type_identifier", "scoped_type_identifier"):
+            return _node_text(type_node, source_bytes)
+        return _node_text(type_node, source_bytes) or None
+
+    def _build_function(
+        self, node, source_bytes: bytes, file: DiscoveredFile, *, receiver_type: str | None
+    ) -> _ParsedFunction | None:
+        name_node = node.child_by_field_name("name")
+        if name_node is None:
+            return None
+        base_name = _node_text(name_node, source_bytes)
+        if not base_name:
+            return None
+        qualified = f"{receiver_type}.{base_name}" if receiver_type else base_name
+        start_line = node.start_point[0] + 1
+        end_line = node.end_point[0] + 1
+        return _ParsedFunction(
+            function_id=f"{file.path}:{qualified}:{start_line}",
+            name=base_name,
+            qualified_name=qualified,
+            class_id=None,
+            class_name=receiver_type,
+            start_line=start_line,
+            end_line=end_line,
+        )
+
+    def _extract_calls(self, node, parsed_fn: _ParsedFunction, source_bytes: bytes) -> list[_ParsedCall]:
+        body = node.child_by_field_name("body")
+        if body is None:
+            return []
+        out: list[_ParsedCall] = []
+        self._collect(body, parsed_fn, source_bytes, out)
+        return out
+
+    def _collect(self, node, parsed_fn: _ParsedFunction, source_bytes: bytes, out: list[_ParsedCall]) -> None:
+        if node.type == "call_expression":
+            fn_node = node.child_by_field_name("function")
+            if fn_node is not None:
+                callee = self._callee(fn_node, source_bytes)
+                if callee is not None:
+                    name, qualified = callee
+                    out.append(
+                        _ParsedCall(
+                            caller_function_id=parsed_fn.function_id,
+                            callee_name=name,
+                            callee_qualified_name=qualified,
+                            caller_class_id=parsed_fn.class_id,
+                            line_number=node.start_point[0] + 1,
+                            evidence=_node_text(node, source_bytes) or name,
+                        )
+                    )
+        for child in node.named_children:
+            self._collect(child, parsed_fn, source_bytes, out)
+
+    def _callee(self, node, source_bytes: bytes) -> tuple[str, str | None] | None:
+        if node.type == "identifier":
+            text = _node_text(node, source_bytes)
+            return (text, None) if text else None
+        if node.type == "field_expression":
+            field = node.child_by_field_name("field")
+            value = node.child_by_field_name("value")
+            if field is None:
+                return None
+            name = _node_text(field, source_bytes)
+            if not name:
+                return None
+            owner = _node_text(value, source_bytes) if value is not None else ""
+            return (name, f"{owner}.{name}") if owner else (name, None)
+        if node.type == "scoped_identifier":
+            name_part = node.child_by_field_name("name")
+            path_part = node.child_by_field_name("path")
+            if name_part is None:
+                return None
+            name = _node_text(name_part, source_bytes)
+            if not name:
+                return None
+            owner = _node_text(path_part, source_bytes) if path_part is not None else ""
+            return (name, f"{owner}::{name}") if owner else (name, None)
+        return None
+
+
+class _KotlinParser:
+    _CONTAINER_TYPES = frozenset({"class_declaration", "object_declaration"})
+
+    def __init__(self, ts_language: Language) -> None:
+        self._parser = Parser(ts_language)
+
+    def parse(self, file: DiscoveredFile, content: str) -> _ParsedFile:
+        source_bytes = content.encode("utf-8", errors="replace")
+        tree = self._parser.parse(source_bytes)
+        functions: list[_ParsedFunction] = []
+        calls: list[_ParsedCall] = []
+        for child in tree.root_node.named_children:
+            if child.type == "function_declaration":
+                fn = self._build_function(child, source_bytes, file, receiver_type=None)
+                if fn is not None:
+                    functions.append(fn)
+                    calls.extend(self._collect_body_calls(child, fn, source_bytes))
+            elif child.type in self._CONTAINER_TYPES:
+                receiver = self._container_name(child, source_bytes)
+                body = self._find_named_child(child, "class_body")
+                if body is None:
+                    continue
+                for member in body.named_children:
+                    if member.type != "function_declaration":
+                        continue
+                    fn = self._build_function(
+                        member, source_bytes, file, receiver_type=receiver
+                    )
+                    if fn is not None:
+                        functions.append(fn)
+                        calls.extend(self._collect_body_calls(member, fn, source_bytes))
+        return _ParsedFile(classes=(), functions=tuple(functions), calls=tuple(calls))
+
+    def _container_name(self, node, source_bytes: bytes) -> str | None:
+        for child in node.named_children:
+            if child.type in ("identifier", "type_identifier"):
+                return _node_text(child, source_bytes) or None
+        return None
+
+    def _find_named_child(self, node, type_name: str):
+        for child in node.named_children:
+            if child.type == type_name:
+                return child
+        return None
+
+    def _build_function(
+        self, node, source_bytes: bytes, file: DiscoveredFile, *, receiver_type: str | None
+    ) -> _ParsedFunction | None:
+        name = None
+        for child in node.named_children:
+            if child.type in ("simple_identifier", "identifier"):
+                name = _node_text(child, source_bytes)
+                break
+        if not name:
+            return None
+        qualified = f"{receiver_type}.{name}" if receiver_type else name
+        start_line = node.start_point[0] + 1
+        end_line = node.end_point[0] + 1
+        return _ParsedFunction(
+            function_id=f"{file.path}:{qualified}:{start_line}",
+            name=name,
+            qualified_name=qualified,
+            class_id=None,
+            class_name=receiver_type,
+            start_line=start_line,
+            end_line=end_line,
+        )
+
+    def _collect_body_calls(self, node, parsed_fn: _ParsedFunction, source_bytes: bytes) -> list[_ParsedCall]:
+        out: list[_ParsedCall] = []
+        body = self._find_named_child(node, "function_body")
+        target = body if body is not None else node
+        self._collect(target, parsed_fn, source_bytes, out)
+        return out
+
+    def _collect(self, node, parsed_fn: _ParsedFunction, source_bytes: bytes, out: list[_ParsedCall]) -> None:
+        if node.type == "call_expression":
+            callee = self._callee(node, source_bytes)
+            if callee is not None:
+                name, qualified = callee
+                out.append(
+                    _ParsedCall(
+                        caller_function_id=parsed_fn.function_id,
+                        callee_name=name,
+                        callee_qualified_name=qualified,
+                        caller_class_id=parsed_fn.class_id,
+                        line_number=node.start_point[0] + 1,
+                        evidence=_node_text(node, source_bytes) or name,
+                    )
+                )
+        for child in node.named_children:
+            self._collect(child, parsed_fn, source_bytes, out)
+
+    def _callee(self, node, source_bytes: bytes) -> tuple[str, str | None] | None:
+        for child in node.named_children:
+            if child.type in ("simple_identifier", "identifier"):
+                text = _node_text(child, source_bytes)
+                return (text, None) if text else None
+            if child.type == "navigation_expression":
+                tail = None
+                head = None
+                for sub in child.named_children:
+                    if sub.type == "navigation_suffix":
+                        tail = sub
+                    else:
+                        head = sub
+                if tail is None:
+                    return None
+                tail_name = _node_text(tail, source_bytes).lstrip(".:")
+                if not tail_name:
+                    return None
+                head_text = _node_text(head, source_bytes) if head is not None else ""
+                return (tail_name, f"{head_text}.{tail_name}") if head_text else (tail_name, None)
+        return None
+
+
+class _LuaParser:
+    def __init__(self, ts_language: Language) -> None:
+        self._parser = Parser(ts_language)
+
+    def parse(self, file: DiscoveredFile, content: str) -> _ParsedFile:
+        source_bytes = content.encode("utf-8", errors="replace")
+        tree = self._parser.parse(source_bytes)
+        functions: list[_ParsedFunction] = []
+        calls: list[_ParsedCall] = []
+        self._walk_top(tree.root_node, source_bytes, file, functions, calls)
+        return _ParsedFile(classes=(), functions=tuple(functions), calls=tuple(calls))
+
+    def _walk_top(
+        self,
+        node,
+        source_bytes: bytes,
+        file: DiscoveredFile,
+        functions: list[_ParsedFunction],
+        calls: list[_ParsedCall],
+    ) -> None:
+        for child in node.named_children:
+            if child.type in ("function_declaration", "local_function"):
+                fn = self._build_function(child, source_bytes, file)
+                if fn is not None:
+                    functions.append(fn)
+                    body = self._find_named_child(child, "block")
+                    if body is not None:
+                        self._collect(body, fn, source_bytes, calls)
+            elif child.type == "do_statement":
+                # Recurse into nested blocks where additional top-level
+                # function declarations may live.
+                self._walk_top(child, source_bytes, file, functions, calls)
+
+    def _find_named_child(self, node, type_name: str):
+        for child in node.named_children:
+            if child.type == type_name:
+                return child
+        return None
+
+    def _build_function(
+        self, node, source_bytes: bytes, file: DiscoveredFile
+    ) -> _ParsedFunction | None:
+        receiver_type: str | None = None
+        base_name: str | None = None
+        for child in node.named_children:
+            if child.type == "identifier":
+                base_name = _node_text(child, source_bytes) or None
+                break
+            if child.type == "dot_index_expression":
+                receiver_type, base_name = self._split_table_field(child, source_bytes, ".")
+                break
+            if child.type == "method_index_expression":
+                receiver_type, base_name = self._split_table_field(child, source_bytes, ":")
+                break
+        if not base_name:
+            return None
+        qualified = f"{receiver_type}.{base_name}" if receiver_type else base_name
+        start_line = node.start_point[0] + 1
+        end_line = node.end_point[0] + 1
+        return _ParsedFunction(
+            function_id=f"{file.path}:{qualified}:{start_line}",
+            name=base_name,
+            qualified_name=qualified,
+            class_id=None,
+            class_name=receiver_type,
+            start_line=start_line,
+            end_line=end_line,
+        )
+
+    def _split_table_field(
+        self, node, source_bytes: bytes, sep: str
+    ) -> tuple[str | None, str | None]:
+        text = _node_text(node, source_bytes)
+        if sep not in text:
+            return None, text or None
+        owner, _, member = text.rpartition(sep)
+        owner = owner.strip()
+        member = member.strip()
+        return (owner or None), (member or None)
+
+    def _collect(self, node, parsed_fn: _ParsedFunction, source_bytes: bytes, out: list[_ParsedCall]) -> None:
+        if node.type == "function_call":
+            callee = self._callee(node, source_bytes)
+            if callee is not None:
+                name, qualified = callee
+                out.append(
+                    _ParsedCall(
+                        caller_function_id=parsed_fn.function_id,
+                        callee_name=name,
+                        callee_qualified_name=qualified,
+                        caller_class_id=parsed_fn.class_id,
+                        line_number=node.start_point[0] + 1,
+                        evidence=_node_text(node, source_bytes) or name,
+                    )
+                )
+        for child in node.named_children:
+            self._collect(child, parsed_fn, source_bytes, out)
+
+    def _callee(self, node, source_bytes: bytes) -> tuple[str, str | None] | None:
+        if not node.named_child_count:
+            return None
+        head = node.named_child(0)
+        if head is None:
+            return None
+        if head.type == "identifier":
+            text = _node_text(head, source_bytes)
+            return (text, None) if text else None
+        if head.type in ("dot_index_expression", "method_index_expression"):
+            sep = "." if head.type == "dot_index_expression" else ":"
+            owner, name = self._split_table_field(head, source_bytes, sep)
+            if not name:
+                return None
+            return (name, f"{owner}.{name}") if owner else (name, None)
+        return None
+
+
+class _SwiftParser:
+    _CONTAINER_TYPES = frozenset({"class_declaration", "protocol_declaration"})
+
+    def __init__(self, ts_language: Language) -> None:
+        self._parser = Parser(ts_language)
+
+    def parse(self, file: DiscoveredFile, content: str) -> _ParsedFile:
+        source_bytes = content.encode("utf-8", errors="replace")
+        tree = self._parser.parse(source_bytes)
+        functions: list[_ParsedFunction] = []
+        calls: list[_ParsedCall] = []
+        for child in tree.root_node.named_children:
+            if child.type == "function_declaration":
+                fn = self._build_function(child, source_bytes, file, receiver_type=None)
+                if fn is not None:
+                    functions.append(fn)
+                    calls.extend(self._collect_body_calls(child, fn, source_bytes))
+            elif child.type in self._CONTAINER_TYPES:
+                receiver = self._container_name(child, source_bytes)
+                body = self._find_named_child(child, "class_body") or self._find_named_child(
+                    child, "protocol_body"
+                )
+                if body is None:
+                    continue
+                for member in body.named_children:
+                    if member.type != "function_declaration":
+                        continue
+                    fn = self._build_function(
+                        member, source_bytes, file, receiver_type=receiver
+                    )
+                    if fn is not None:
+                        functions.append(fn)
+                        calls.extend(self._collect_body_calls(member, fn, source_bytes))
+        return _ParsedFile(classes=(), functions=tuple(functions), calls=tuple(calls))
+
+    def _container_name(self, node, source_bytes: bytes) -> str | None:
+        for child in node.named_children:
+            if child.type == "type_identifier":
+                return _node_text(child, source_bytes) or None
+            if child.type == "user_type":
+                inner = self._find_named_child(child, "type_identifier")
+                if inner is not None:
+                    return _node_text(inner, source_bytes) or None
+        return None
+
+    def _find_named_child(self, node, type_name: str):
+        for child in node.named_children:
+            if child.type == type_name:
+                return child
+        return None
+
+    def _build_function(
+        self, node, source_bytes: bytes, file: DiscoveredFile, *, receiver_type: str | None
+    ) -> _ParsedFunction | None:
+        name: str | None = None
+        for child in node.named_children:
+            if child.type in ("simple_identifier", "identifier"):
+                name = _node_text(child, source_bytes)
+                break
+        if not name:
+            return None
+        qualified = f"{receiver_type}.{name}" if receiver_type else name
+        start_line = node.start_point[0] + 1
+        end_line = node.end_point[0] + 1
+        return _ParsedFunction(
+            function_id=f"{file.path}:{qualified}:{start_line}",
+            name=name,
+            qualified_name=qualified,
+            class_id=None,
+            class_name=receiver_type,
+            start_line=start_line,
+            end_line=end_line,
+        )
+
+    def _collect_body_calls(self, node, parsed_fn: _ParsedFunction, source_bytes: bytes) -> list[_ParsedCall]:
+        body = self._find_named_child(node, "function_body")
+        target = body if body is not None else node
+        out: list[_ParsedCall] = []
+        self._collect(target, parsed_fn, source_bytes, out)
+        return out
+
+    def _collect(self, node, parsed_fn: _ParsedFunction, source_bytes: bytes, out: list[_ParsedCall]) -> None:
+        if node.type == "call_expression":
+            callee = self._callee(node, source_bytes)
+            if callee is not None:
+                name, qualified = callee
+                out.append(
+                    _ParsedCall(
+                        caller_function_id=parsed_fn.function_id,
+                        callee_name=name,
+                        callee_qualified_name=qualified,
+                        caller_class_id=parsed_fn.class_id,
+                        line_number=node.start_point[0] + 1,
+                        evidence=_node_text(node, source_bytes) or name,
+                    )
+                )
+        for child in node.named_children:
+            self._collect(child, parsed_fn, source_bytes, out)
+
+    def _callee(self, node, source_bytes: bytes) -> tuple[str, str | None] | None:
+        for child in node.named_children:
+            if child.type in ("simple_identifier", "identifier"):
+                text = _node_text(child, source_bytes)
+                return (text, None) if text else None
+            if child.type == "navigation_expression":
+                suffix = self._find_named_child(child, "navigation_suffix")
+                if suffix is None:
+                    return None
+                tail = _node_text(suffix, source_bytes).lstrip(".")
+                if not tail:
+                    return None
+                head_text = ""
+                for sub in child.named_children:
+                    if sub.type != "navigation_suffix":
+                        head_text = _node_text(sub, source_bytes)
+                        break
+                return (tail, f"{head_text}.{tail}") if head_text else (tail, None)
+        return None
+
+
 _GO_LANGUAGE = Language(_tsgo.language())
 _JAVA_LANGUAGE = Language(_tsjava.language())
 _JS_LANGUAGE = Language(_tsjs.language())
 _TS_LANGUAGE = Language(_tsts.language_tsx())
+_RUST_LANGUAGE = Language(_tsrust.language())
+_KOTLIN_LANGUAGE = Language(_tskotlin.language())
+_LUA_LANGUAGE = Language(_tslua.language())
+_SWIFT_LANGUAGE = Language(_tsswift.language())
 
 
 _PARSER_REGISTRY: dict[str, LanguageParser] = {
@@ -1253,6 +1733,10 @@ _PARSER_REGISTRY: dict[str, LanguageParser] = {
     "java": _JavaParser(_JAVA_LANGUAGE),
     "javascript": _JsLikeParser(_JS_LANGUAGE),
     "typescript": _JsLikeParser(_TS_LANGUAGE),
+    "rust": _RustParser(_RUST_LANGUAGE),
+    "kotlin": _KotlinParser(_KOTLIN_LANGUAGE),
+    "lua": _LuaParser(_LUA_LANGUAGE),
+    "swift": _SwiftParser(_SWIFT_LANGUAGE),
 }
 
 

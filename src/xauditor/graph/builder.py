@@ -889,4 +889,12 @@ def _language_for_path(path: Path) -> str:
         return "php"
     if path.suffix in {".mjs", ".cjs"}:
         return "javascript"
+    if path.suffix == ".rs":
+        return "rust"
+    if path.suffix in {".kt", ".kts"}:
+        return "kotlin"
+    if path.suffix == ".lua":
+        return "lua"
+    if path.suffix == ".swift":
+        return "swift"
     return path.suffix.lstrip(".") or "text"

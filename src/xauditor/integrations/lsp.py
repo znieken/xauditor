@@ -1,3 +1,18 @@
+"""Language-server availability checks and lightweight Python introspection.
+
+:data:`DEFAULT_SERVER_MAP` declares one entry per language xauditor knows
+about, with the binary name and a one-line install hint. The graph builder
+calls :meth:`LanguageServerRegistry.availability_for_paths` to surface
+"missing language server" warnings into the LLM's context, and calls
+:meth:`hover` / :meth:`diagnostics` per file during graph enrichment.
+
+Note: :meth:`hover` and :meth:`diagnostics` currently produce values only for
+Python (via the stdlib ``ast`` module). For every other language they
+short-circuit to ``None`` / ``[]``. Real LSP-protocol integration for the
+non-Python languages is future work; for now ``DEFAULT_SERVER_MAP`` mostly
+drives the capability surface seen by the LLM.
+"""
+
 from __future__ import annotations
 
 import ast
@@ -49,6 +64,26 @@ DEFAULT_SERVER_MAP = {
         "binary": "jdtls",
         "install": "Install Eclipse JDT Language Server (jdtls)",
         "extensions": [".java"],
+    },
+    "kotlin": {
+        "binary": "kotlin-language-server",
+        "install": "brew install kotlin-language-server (macOS) or download from https://github.com/fwcd/kotlin-language-server/releases",
+        "extensions": [".kt", ".kts"],
+    },
+    "lua": {
+        "binary": "lua-language-server",
+        "install": "apt/dnf/pacman/brew/winget install lua-language-server (see https://luals.github.io/)",
+        "extensions": [".lua"],
+    },
+    "rust": {
+        "binary": "rust-analyzer",
+        "install": "rustup component add rust-analyzer",
+        "extensions": [".rs"],
+    },
+    "swift": {
+        "binary": "sourcekit-lsp",
+        "install": "Install the Swift toolchain from https://www.swift.org/install/ (sourcekit-lsp ships with the toolchain)",
+        "extensions": [".swift"],
     },
 }
 
