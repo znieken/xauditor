@@ -19,6 +19,10 @@ CODE_SUFFIXES = {
     ".c", ".h",
     ".cc", ".cpp", ".cxx", ".hpp", ".hh", ".hxx",
     ".cs",
+    ".rs",
+    ".kt", ".kts",
+    ".lua",
+    ".swift",
 }
 DEFAULT_IGNORED_PARTS = {".git", ".venv", "__pycache__", "node_modules", ".xauditor"}
 
