@@ -7,6 +7,7 @@ import {
   PaginationFooter,
   usePagination,
 } from "@/components/paginated-list";
+import { RunningAuditsBadge } from "@/components/running-audits-badge";
 import { EmptyState } from "@/components/ui/empty-state";
 import { useProjects } from "@/lib/api";
 import { formatTimestamp } from "@/lib/utils";
@@ -58,12 +59,18 @@ export default function ProjectListPage() {
                   className="border-t border-zinc-100 transition-colors hover:bg-zinc-50/70 dark:border-zinc-800 dark:hover:bg-zinc-800/40"
                 >
                   <td className="px-5 py-3">
-                    <Link
-                      href={`/reports/projects/${project.project_key}/builds`}
-                      className="font-medium text-zinc-900 hover:underline dark:text-zinc-100"
-                    >
-                      {project.project_name}
-                    </Link>
+                    <div className="flex items-center gap-2">
+                      <Link
+                        href={`/reports/projects/${project.project_key}/builds`}
+                        className="font-medium text-zinc-900 hover:underline dark:text-zinc-100"
+                      >
+                        {project.project_name}
+                      </Link>
+                      <RunningAuditsBadge
+                        count={project.running_audit_runs}
+                        aria-label={`${project.running_audit_runs} audits running for ${project.project_name}`}
+                      />
+                    </div>
                     <div className="font-mono text-xs text-zinc-500 dark:text-zinc-400">
                       {project.repo_root}
                     </div>

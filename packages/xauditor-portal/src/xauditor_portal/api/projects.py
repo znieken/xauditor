@@ -18,7 +18,7 @@ from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
-from sqlalchemy import desc, func, select, tuple_
+from sqlalchemy import case, desc, func, select, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from xauditor_portal.api.runs import (
@@ -40,6 +40,7 @@ class ProjectSummary(BaseModel):
     repo_root: str
     total_graph_builds: int
     total_audit_runs: int
+    running_audit_runs: int
     added_at: datetime
 
 
@@ -110,6 +111,9 @@ async def list_projects(
             AuditRun.project_name,
             func.count(func.distinct(AuditRun.build_fingerprint)).label("builds"),
             func.count(AuditRun.id).label("runs"),
+            func.sum(case((AuditRun.status == "in_progress", 1), else_=0)).label(
+                "running"
+            ),
             func.min(AuditRun.started_at).label("added_at"),
         )
         .group_by(AuditRun.repo_root, AuditRun.project_name)
@@ -130,6 +134,7 @@ async def list_projects(
             repo_root=row.repo_root,
             total_graph_builds=int(row.builds or 0),
             total_audit_runs=int(row.runs or 0),
+            running_audit_runs=int(row.running or 0),
             added_at=row.added_at,
         )
         for row in rows

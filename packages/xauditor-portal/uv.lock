@@ -852,7 +852,7 @@ wheels = [
 
 [[package]]
 name = "xauditor-portal"
-version = "0.6.0"
+version = "1.0.2"
 source = { editable = "." }
 dependencies = [
     { name = "alembic" },

@@ -441,9 +441,21 @@ export function useEffectiveLLMConfig() {
 }
 
 export function useProjects(params: { limit?: number; offset?: number }) {
+  const onFirstPage = (params.offset ?? 0) === 0;
   return useQuery({
     queryKey: ["projects", params],
     queryFn: () => api.listProjects(params),
+    // Poll every 3s on page 1 (newly-started audits surface as the
+    // `RunningAuditsBadge`) OR when any visible row reports
+    // `running_audit_runs > 0` (badge count keeps up with starts/stops).
+    // Pages >=2 with only idle rows are historical views and do not poll.
+    // Mirrors the `useBuildsForProject` / `useRunsForBuild` rule.
+    refetchInterval: (query) => {
+      const page = query.state.data;
+      if (!page) return false;
+      if (onFirstPage) return 3000;
+      return page.items.some((p) => p.running_audit_runs > 0) ? 3000 : false;
+    },
   });
 }
 

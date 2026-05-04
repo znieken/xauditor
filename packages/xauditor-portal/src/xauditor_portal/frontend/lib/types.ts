@@ -118,6 +118,7 @@ export interface ProjectSummary {
   repo_root: string;
   total_graph_builds: number;
   total_audit_runs: number;
+  running_audit_runs: number;
   added_at: string;
 }
 
