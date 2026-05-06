@@ -422,6 +422,13 @@ def _build_envelope(
                 "unlabeled": int(run_row.unlabeled_findings or 0),
             },
         },
+        # Phase 5A: top-level `coverage_gaps` field (Markdown is
+        # rendered by `markdown.py` from the same JSON shape).
+        # `None` for runs created before alembic 0011 added the
+        # column AND for runs whose `audit.coverage_gaps.report`
+        # was false. The portal renders an "n/a — pre-rename
+        # audit" placeholder for null values.
+        "coverage_gaps": getattr(run_row, "coverage_gaps", None),
         "findings": findings_payload,
         "coverage": coverage_payload,
         "validator_debates": debates_payload,
@@ -648,6 +655,28 @@ def _render_markdown_bundle(
                 render_coder_results_report(
                     audit_run.findings, coder_enabled=coder_enabled
                 ),
+                redact=redact,
+            )
+        )
+    # Phase 5A: emit `coverage-gaps.md` whenever the envelope
+    # carries a non-null `coverage_gaps` payload. NULL means the
+    # operator turned off `audit.coverage_gaps.report` OR the run
+    # predates the column.
+    coverage_gaps_payload = envelope.get("coverage_gaps")
+    if coverage_gaps_payload:
+        from xauditor.coverage_gaps import CoverageGaps
+
+        gaps = CoverageGaps(
+            audited_classes=tuple(coverage_gaps_payload.get("audited_classes", ())),
+            skipped_by_mode=tuple(coverage_gaps_payload.get("skipped_by_mode", ())),
+            out_of_scope=tuple(coverage_gaps_payload.get("out_of_scope", ())),
+            mode=str(coverage_gaps_payload.get("mode", "")),
+            advice_to_user=str(coverage_gaps_payload.get("advice_to_user", "")),
+        )
+        files.append(
+            _write_md(
+                output_dir / "coverage-gaps.md",
+                gaps.to_markdown_section(),
                 redact=redact,
             )
         )

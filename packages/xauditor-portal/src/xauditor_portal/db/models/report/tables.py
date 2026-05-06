@@ -39,7 +39,15 @@ class AuditRun(Base):
     repo_root: Mapped[str] = mapped_column(String(2048), nullable=False)
     project_name: Mapped[str] = mapped_column(String(512), nullable=False)
     build_fingerprint: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
-    mode: Mapped[str] = mapped_column(String(16), nullable=False)  # "single" | "team"
+    mode: Mapped[str] = mapped_column(String(16), nullable=False)  # "fast" | "deep"
+    # Stage-call form selected at run-open time (`audit.stages.form`).
+    # Persisted (alembic 0014) so the portal can show which form a run
+    # used without inferring from downstream artifacts. Default 'prompt'
+    # mirrors the column default; the CHECK constraint enforces the
+    # closed enum at the DB layer.
+    stages_form: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="prompt"
+    )
     status: Mapped[str] = mapped_column(String(32), nullable=False)  # "in_progress" | "completed" | "failed" | "cancelled"
     progress_percent: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     total_candidates: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
@@ -66,6 +74,15 @@ class AuditRun(Base):
     # path surfaces a clear "started on a previous version, please re-run
     # from scratch" error in that case.
     resume_state: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    # CoverageGaps JSONB written by Phase 5 of
+    # ``restructure-audit-modes-and-coverage`` (column added by alembic
+    # migration 0011 in Phase 1). Phase 1 writes ``NULL``; pre-rename
+    # runs are also ``NULL``. Schema (when populated):
+    #   {audited_classes: [...], skipped_by_mode: [...],
+    #    out_of_scope: [...], mode: "fast"|"deep",
+    #    advice_to_user: "..."}
+    # Portal renders an "n/a — pre-rename audit" placeholder when NULL.
+    coverage_gaps: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
 
     findings: Mapped[list["Finding"]] = relationship(back_populates="run", cascade="all, delete-orphan")
     progress_events: Mapped[list["ProgressEvent"]] = relationship(
@@ -105,6 +122,23 @@ class Finding(Base):
     exploitation_steps: Mapped[str] = mapped_column(Text, nullable=False)
     validation_status: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
     validation_analysis: Mapped[str] = mapped_column(Text, nullable=False)
+    # Cross-unit reconciliation JSONB written by the deep-mode
+    # reconciler stage (Phase 5A's `PassthroughReconciler` writes
+    # NULL for Path-only findings; the real `AgenticReconciler`
+    # populates `{per_unit_verdicts, consolidated_verdict,
+    # consolidation_reasoning}` when SinkAuditUnit / EntryAuditUnit
+    # / etc. enumeration ships). Column added by alembic 0012.
+    # NULL on every row from runs predating the multi-unit
+    # enumeration follow-up.
+    reconciliation: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    # Per-finding agentic tool-call transcript written by
+    # `AgenticStageRunner` when `audit.stages.form: agentic`.
+    # JSON list of `{tool, input, output}` records. NULL on
+    # prompt-form findings AND on findings produced before
+    # alembic 0013 (`agentic-stage-runner-real` Phase 2).
+    # PSIRT replays the transcript during finding triage to
+    # see what evidence the agent collected.
+    agentic_transcript: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = mapped_column(nullable=False, default=utcnow)
 
     run: Mapped[AuditRun] = relationship(back_populates="findings")

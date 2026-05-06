@@ -11,7 +11,7 @@ import {
   usePagination,
 } from "@/components/paginated-list";
 import { ProgressBar } from "@/components/progress-bar";
-import { ModeChip, StatusChip } from "@/components/status-chip";
+import { ModeChip, StagesFormChip, StatusChip } from "@/components/status-chip";
 import { Button } from "@/components/ui/button";
 import { EmptyState } from "@/components/ui/empty-state";
 import { ApiError, api, useMe, useProjects, useRunsForBuild } from "@/lib/api";
@@ -145,7 +145,10 @@ export default function RunListPage({
                     </Link>
                   </td>
                   <td className="px-5 py-3">
-                    <ModeChip mode={run.mode} />
+                    <div className="flex items-center gap-1.5">
+                      <ModeChip mode={run.mode} />
+                      <StagesFormChip stages_form={run.stages_form} compact />
+                    </div>
                   </td>
                   <td className="px-5 py-3">
                     <StatusChip status={run.status} />
@@ -162,8 +165,6 @@ export default function RunListPage({
                     </div>
                   </td>
                   <td className="px-5 py-3 text-xs text-zinc-700 dark:text-zinc-300">
-                    <span className="font-medium">{run.total_candidates}</span>{" "}
-                    total /{" "}
                     <span className="font-medium text-emerald-600 dark:text-emerald-400">
                       {run.valid_findings}
                     </span>{" "}

@@ -45,8 +45,8 @@ class _CountingAnalyzer:
     def __init__(self) -> None:
         self.calls = 0
 
-    def run(self, *, unit, path_functions, path_context=None):
-        del path_functions, path_context
+    def run(self, *, unit, path_functions, path_context=None, excluded_findings=()):
+        del path_functions, path_context, excluded_findings
         self.calls += 1
         return AnalyzerResult(
             status="candidate",
@@ -73,7 +73,7 @@ class _CountingValidator:
     def __init__(self) -> None:
         self.calls = 0
 
-    def run(self, *, unit, analyzer, exploitation, path_context=None):
+    def run(self, *, unit, analyzer, exploitation=None, path_context=None):
         del unit, analyzer, exploitation, path_context
         self.calls += 1
         return ValidationResult(status=ValidationStatus.VALID, analysis="Validated")

@@ -11,12 +11,16 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { AuditLogView } from "@/components/audit-log-view";
 import { CoverageView } from "@/components/coverage-view";
+import { CoveragePanel } from "@/components/coverage-panel";
 import { FindingsView } from "@/components/findings-view";
-import { ModeChip, StatusChip } from "@/components/status-chip";
+import { ModeChip, StagesFormChip, StatusChip } from "@/components/status-chip";
 import { ProgressBar } from "@/components/progress-bar";
 import { cn, formatTimestamp } from "@/lib/utils";
 import { ApiError, api, useMe, useProjects, useRun } from "@/lib/api";
 import type { FeedbackBreakdown, RunDetail, RunsPage } from "@/lib/types";
+
+const FP_METRIC_TOOLTIP =
+  "Counts findings whose latest reviewer feedback is `false positive`. The agent's `validation_status` field does not contribute.";
 
 type SubTab = "findings" | "coverage" | "audit-log";
 
@@ -103,6 +107,7 @@ export default function RunDetailPage({
           </div>
           <div className="flex flex-wrap items-center gap-2">
             <ModeChip mode={run.mode} />
+            <StagesFormChip stages_form={run.stages_form} />
             <StatusChip status={run.status} />
             {isAdmin ? (
               <AdminRunHeaderActions
@@ -134,23 +139,27 @@ export default function RunDetailPage({
             ) : null}
           </div>
           <div className="grid grid-cols-2 gap-3 text-sm md:grid-cols-4">
-            <Metric label="Total candidates" value={run.total_candidates} />
             <MetricWithFeedback
               label="Valid findings"
               breakdown={run.valid_findings_breakdown}
               tone="success"
             />
-            <MetricWithFeedback
+            <Metric
               label="False positives"
-              breakdown={run.false_positives_breakdown}
+              value={run.false_positives}
               tone="muted"
+              titleAttr={FP_METRIC_TOOLTIP}
             />
             <Metric
               label="Duplicates"
               value={run.duplicate_findings ?? 0}
             />
             <Metric label="Unlabeled" value={run.unlabeled_findings} />
-            <Metric label="Valid rate" value={formatValidRate(run.valid_rate)} />
+            <Metric
+              label="Positive rate"
+              value={formatValidRate(run.valid_rate)}
+              titleAttr="Agent precision after reviewer feedback: post-feedback Valid count divided by the agent's Valid-side pool (Valid / Partial Valid / Inconclusive). Values above 100% mean the reviewer promoted more False Positive findings to true_positive than they downgraded Valid to false_positive."
+            />
           </div>
           <div className="grid grid-cols-1 gap-3 text-xs text-zinc-500 dark:text-zinc-400 md:grid-cols-3">
             <div>
@@ -203,11 +212,18 @@ export default function RunDetailPage({
 
       <section>
         {tab === "findings" ? (
-          <FindingsView
-            runId={run.id}
-            runMode={run.mode}
-            runStatus={run.status}
-          />
+          <>
+            <CoveragePanel
+              coverageGaps={run.coverage_gaps}
+              runMode={run.mode}
+              runId={run.id}
+            />
+            <FindingsView
+              runId={run.id}
+              runMode={run.mode}
+              runStatus={run.status}
+            />
+          </>
         ) : null}
         {tab === "coverage" ? (
           <CoverageView runId={run.id} runStatus={run.status} />
@@ -249,13 +265,18 @@ function Metric({
   label,
   value,
   tone,
+  titleAttr,
 }: {
   label: string;
   value: number | string;
   tone?: "success" | "muted";
+  titleAttr?: string;
 }) {
   return (
-    <div className="rounded-lg border border-zinc-200 bg-white px-3 py-2 dark:border-zinc-800 dark:bg-zinc-900/60">
+    <div
+      className="rounded-lg border border-zinc-200 bg-white px-3 py-2 dark:border-zinc-800 dark:bg-zinc-900/60"
+      title={titleAttr}
+    >
       <div className="text-[11px] uppercase tracking-wider text-zinc-500 dark:text-zinc-400">
         {label}
       </div>

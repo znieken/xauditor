@@ -234,6 +234,20 @@ class _TestOnlyGraphSource:
         del page_size
         yield from self._module_symbols
 
+    def fetch_decorators_for(self, function_ids):
+        # `capture-decorators-and-registrations` Phase 2.1 — test
+        # source carries no decorator data by default. Tests that
+        # exercise GraphSlice.decorator_chain build their own
+        # source / mock the audit-side fetch directly.
+        del function_ids
+        return {}
+
+    def fetch_registrations_for(self, function_ids):
+        # `capture-decorators-and-registrations` Commit C — same
+        # default as decorators.
+        del function_ids
+        return {}
+
     def lookup_function_by_id(
         self, function_id: str
     ) -> FunctionRecord | None:

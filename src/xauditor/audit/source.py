@@ -8,11 +8,13 @@ from xauditor.models import (
     AuditPlan,
     ClassRecord,
     CoverageInventory,
+    DecoratorRecord,
     EdgeRecord,
     FunctionRecord,
     FunctionSymbolUseEdge,
     ModuleSymbolRecord,
     PathRecord,
+    RegistrationSiteRecord,
 )
 
 
@@ -98,6 +100,29 @@ class AuditGraphSource(Protocol):
     def load_path_symbols(
         self, function_ids: Sequence[str]
     ) -> tuple[tuple[ModuleSymbolRecord, ...], tuple[FunctionSymbolUseEdge, ...]]: ...
+
+    def fetch_decorators_for(
+        self, function_ids: Sequence[str]
+    ) -> dict[str, list["DecoratorRecord"]]:
+        """Return `{function_id: [DecoratorRecord ordered by position]}`.
+
+        `capture-decorators-and-registrations` Phase 2.1.
+        Implementations that don't carry decorator data (legacy
+        graphs, test fixtures that construct the source without
+        a builder run) MAY return an empty dict.
+        """
+        ...
+
+    def fetch_registrations_for(
+        self, function_ids: Sequence[str]
+    ) -> dict[str, list["RegistrationSiteRecord"]]:
+        """Return `{function_id: [RegistrationSiteRecord ...]}`.
+
+        `capture-decorators-and-registrations` Phase 2.1 / Commit C.
+        Implementations that don't carry registration data MAY
+        return an empty dict.
+        """
+        ...
 
     def build_coverage(
         self,

@@ -32,6 +32,33 @@ class _ParsedClassMember:
 
 
 @dataclass(frozen=True)
+class _ParsedDecorator:
+    """One decorator applied to a function or method.
+
+    `expression` is the source text of the decorator
+    expression itself (without the leading `@`), e.g.
+    `'app.route("/users")'` or `'login_required'`. Used by
+    `framework_heuristics.classify_decorator(...)` to derive
+    `(framework, intent)` labels via pattern matching on the
+    expression.
+
+    `position` is the 0-indexed bottom-up rank — `0` is the
+    decorator closest to the function definition, which is
+    applied FIRST at runtime. Matches the order Python applies
+    decorators.
+
+    Languages without a decorator-equivalent syntactic form
+    (Go / C / C++ / Lua / Rust / Swift) emit empty tuples on
+    their `_ParsedFunction.decorators` field — no upstream
+    branches needed because the field defaults to `()`.
+    """
+
+    expression: str
+    line: int
+    position: int
+
+
+@dataclass(frozen=True)
 class _ParsedFunction:
     function_id: str
     name: str
@@ -40,6 +67,16 @@ class _ParsedFunction:
     class_name: str | None
     start_line: int
     end_line: int
+    decorators: tuple["_ParsedDecorator", ...] = ()
+    # `capture-decorators-and-registrations` Commit F. True when
+    # the function body contains at least one assignment to a
+    # `self.<attr>` attribute (direct or augmented). Used by the
+    # planner's StateAuditUnit emission to find classes whose
+    # methods mutate instance state. Computed Python-only today;
+    # other parsers default this to False (`mutates_self=False`)
+    # — adding language-specific detection happens in follow-ups,
+    # mirroring the decorator-capture rollout.
+    mutates_self: bool = False
 
 
 @dataclass(frozen=True)
@@ -83,12 +120,118 @@ class _ParsedSymbolUse:
 
 
 @dataclass(frozen=True)
+class _ParsedRegistration:
+    """One framework registration call site detected by the parser.
+
+    `capture-decorators-and-registrations` Phase 1.3. Registrations
+    are call-site patterns that bind a function reference into a
+    framework's request / task pipeline (e.g. Flask
+    `app.add_url_rule(url, view)`, Django
+    `path(url, view)`, Starlette `app.add_event_handler(event,
+    handler)`). The walker captures the call site itself; the
+    function reference is un-resolved at this layer
+    (`callable_name` is just the AST name of the referenced
+    function — canonical.py resolves to a `function_id` against
+    the parsed function table).
+    """
+
+    framework: str  # "flask" | "django" | "starlette" | etc.
+    intent: str     # "route" | "event_handler" | etc. — closed set in framework_heuristics
+    line: int
+    callable_name: str  # name of the registered function (un-resolved)
+    expression: str  # source-text of the registration call site
+
+
+@dataclass(frozen=True)
 class _ParsedFile:
     classes: tuple[_ParsedClass, ...]
     functions: tuple[_ParsedFunction, ...]
     calls: tuple[_ParsedCall, ...]
     module_symbols: tuple[_ParsedModuleSymbol, ...] = ()
     symbol_uses: tuple[_ParsedSymbolUse, ...] = ()
+    registrations: tuple[_ParsedRegistration, ...] = ()
+
+
+def _classify_registration_call(node: ast.Call) -> tuple[str, str, str]:
+    """Match an `ast.Call` against framework registration patterns.
+
+    Returns `(framework, intent, callable_name)` for recognised
+    patterns, or `("", "", "")` when the call doesn't match.
+
+    `callable_name` is extracted from the AST argument that holds
+    the registered function reference — typically an `ast.Name`
+    (`list_users`) or `ast.Attribute` (`views.list_users`).
+    Lambdas / dynamic dispatch / non-name args yield no
+    registration (the resolver wouldn't find them anyway).
+    """
+
+    func = node.func
+    args = node.args
+
+    # `<callable>.add_url_rule(...)` (Flask)
+    if isinstance(func, ast.Attribute) and func.attr == "add_url_rule":
+        # 2-arg form: add_url_rule(url, view_func)
+        # 3-arg form: add_url_rule(url, name, view_func)
+        if len(args) == 2:
+            view = _name_from_ast(args[1])
+        elif len(args) >= 3:
+            view = _name_from_ast(args[2])
+        else:
+            return "", "", ""
+        if view:
+            return "flask", "route", view
+        return "", "", ""
+
+    # `<callable>.add_event_handler(event, handler)` (Starlette)
+    if isinstance(func, ast.Attribute) and func.attr == "add_event_handler":
+        if len(args) >= 2:
+            handler = _name_from_ast(args[1])
+            if handler:
+                return "starlette", "event_handler", handler
+        return "", "", ""
+
+    # `path(url, view)` / `re_path(url, view)` (Django)
+    if isinstance(func, ast.Name) and func.id in ("path", "re_path"):
+        if len(args) >= 2:
+            view = _name_from_ast(args[1])
+            if view:
+                return "django", "route", view
+        return "", "", ""
+
+    return "", "", ""
+
+
+def _name_from_ast(node: ast.AST) -> str:
+    """Extract a reference name from an ast expression node.
+
+    `ast.Name('foo')` → `"foo"`.
+    `ast.Attribute(value=Name('mod'), attr='foo')` → `"foo"`
+    (we return the rightmost attribute since the canonical.py
+    resolver matches on bare function names).
+
+    Lambdas / calls / strings / non-name expressions return `""`.
+    """
+
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    return ""
+
+
+def _decorator_text_fallback(node: ast.AST) -> str:
+    """Best-effort source-text reconstruction when
+    `ast.get_source_segment` returns None (rare — only happens
+    when the parser was given a `tree` produced from another
+    `content` string, or when the segment crosses a parse
+    error). Walks the ast node and emits a compact
+    `func.attr(arg)` shape so `framework_heuristics` pattern
+    matching still works."""
+
+    try:
+        return ast.unparse(node)
+    except Exception:  # noqa: BLE001 - last-resort fallback
+        return ""
 
 
 _LITERAL_PLACEHOLDER_THRESHOLD = 256
@@ -141,7 +284,7 @@ class PythonParser:
         for node in tree.body:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 fn = self._build_function(
-                    node=node, file=file, class_id=None, class_name=None
+                    node=node, file=file, class_id=None, class_name=None, content=content
                 )
                 functions.append(fn)
                 function_nodes_by_id[fn.function_id] = node
@@ -154,7 +297,7 @@ class PythonParser:
                 for child in node.body:
                     if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
                         method = self._build_function(
-                            node=child, file=file, class_id=class_id, class_name=node.name
+                            node=child, file=file, class_id=class_id, class_name=node.name, content=content
                         )
                         methods.append(method)
                         function_nodes_by_id[method.function_id] = child
@@ -223,13 +366,63 @@ class PythonParser:
                     )
                 )
 
+        registrations = self._extract_registrations(tree, content=content)
+
         return _ParsedFile(
             classes=tuple(classes),
             functions=tuple(functions),
             calls=tuple(calls),
             module_symbols=tuple(module_symbols),
             symbol_uses=tuple(symbol_uses),
+            registrations=tuple(registrations),
         )
+
+    @staticmethod
+    def _extract_registrations(
+        tree: ast.Module, *, content: str
+    ) -> list[_ParsedRegistration]:
+        """Walk the module body for framework registration call sites.
+
+        `capture-decorators-and-registrations` Phase 1.3. Recognises
+        the documented patterns:
+
+        - **Flask**: `<callable>.add_url_rule(url, view_func)` and
+          `<callable>.add_url_rule(url, name, view_func)` (3-arg
+          form names the route explicitly).
+        - **Django**: `path(url, view)` / `re_path(url, view)`
+          inside `urlpatterns = [...]`.
+        - **Starlette**: `<callable>.add_event_handler(event, handler)`.
+
+        Skips recognition for patterns covered by decorator capture
+        (Celery `@task`, FastAPI `@app.get(...)`).
+
+        Returns a list of `_ParsedRegistration` records. The
+        `callable_name` field is un-resolved — canonical.py
+        resolves to a `function_id` against the per-file function
+        table.
+        """
+
+        registrations: list[_ParsedRegistration] = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            framework, intent, callable_name = _classify_registration_call(node)
+            if not framework or not callable_name:
+                continue
+            expression = (
+                ast.get_source_segment(content, node)
+                or _decorator_text_fallback(node)
+            ) or ""
+            registrations.append(
+                _ParsedRegistration(
+                    framework=framework,
+                    intent=intent,
+                    line=getattr(node, "lineno", 0),
+                    callable_name=callable_name,
+                    expression=expression.strip(),
+                )
+            )
+        return registrations
 
     def _extract_module_assignments(
         self, node: ast.AST, *, file: DiscoveredFile, content: str
@@ -316,9 +509,14 @@ class PythonParser:
         file: DiscoveredFile,
         class_id: str | None,
         class_name: str | None,
+        content: str = "",
     ) -> _ParsedFunction:
         qualified_name = f"{class_name}.{node.name}" if class_name else node.name
         end_line = getattr(node, "end_lineno", node.lineno)
+        decorators = self._extract_decorators(node, content=content)
+        mutates_self = (
+            self._detect_self_mutation(node) if class_id is not None else False
+        )
         return _ParsedFunction(
             function_id=f"{file.path}:{qualified_name}:{node.lineno}",
             name=node.name,
@@ -327,7 +525,101 @@ class PythonParser:
             class_name=class_name,
             start_line=node.lineno,
             end_line=end_line,
+            decorators=decorators,
+            mutates_self=mutates_self,
         )
+
+    @staticmethod
+    def _detect_self_mutation(
+        node: ast.FunctionDef | ast.AsyncFunctionDef,
+    ) -> bool:
+        """Return True when the method body assigns to `self.<x>`.
+
+        Detects:
+
+        - `self.x = ...`        (`ast.Assign` to `Attribute(value=Name('self'))`)
+        - `self.x: T = ...`     (`ast.AnnAssign`)
+        - `self.x += ...`       (`ast.AugAssign`)
+
+        Does NOT walk into nested function definitions inside the
+        method — those have their own self-binding scope (via
+        `def` or `async def`). Lambdas use closure capture of
+        `self`, which is rare and ambiguous; treated as
+        out-of-scope today.
+
+        The `self` name is the conventional first-arg
+        receiver. Methods using a different name (e.g.
+        `cls`, or `this`) are not detected — that's a deliberate
+        scoping choice; instance-mutating methods overwhelmingly
+        use `self` in idiomatic Python.
+        """
+
+        # Manual recursion (not ast.walk) so that hitting a
+        # nested function/class scope can prune the entire
+        # subtree — `ast.walk` would still yield the inner
+        # scope's descendants and cause leakage.
+
+        def _scan(current: ast.AST) -> bool:
+            for child in ast.iter_child_nodes(current):
+                if isinstance(
+                    child,
+                    (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef),
+                ):
+                    # Fresh `self` semantics inside this scope —
+                    # don't descend further. (Closure captures
+                    # are intentionally out of scope.)
+                    continue
+                target_nodes: list[ast.expr] = []
+                if isinstance(child, ast.Assign):
+                    target_nodes = list(child.targets)
+                elif isinstance(child, ast.AugAssign):
+                    target_nodes = [child.target]
+                elif isinstance(child, ast.AnnAssign):
+                    target_nodes = [child.target]
+                for target in target_nodes:
+                    if (
+                        isinstance(target, ast.Attribute)
+                        and isinstance(target.value, ast.Name)
+                        and target.value.id == "self"
+                    ):
+                        return True
+                if _scan(child):
+                    return True
+            return False
+
+        return _scan(node)
+
+    @staticmethod
+    def _extract_decorators(
+        node: ast.FunctionDef | ast.AsyncFunctionDef, *, content: str
+    ) -> tuple[_ParsedDecorator, ...]:
+        """Extract `@decorator` chain from an ast function node.
+
+        Position 0 is the decorator listed CLOSEST to the function
+        definition (last in `decorator_list`, applied FIRST at
+        runtime). This matches Python's actual application order
+        + the canonical "bottom-up chain" semantics used by
+        `framework_heuristics`.
+        """
+
+        decorator_list = list(getattr(node, "decorator_list", []) or [])
+        if not decorator_list:
+            return ()
+        records: list[_ParsedDecorator] = []
+        # Reverse so position 0 = closest-to-function (innermost
+        # / applied first).
+        for position, deco in enumerate(reversed(decorator_list)):
+            expression = (
+                ast.get_source_segment(content, deco) or _decorator_text_fallback(deco)
+            )
+            records.append(
+                _ParsedDecorator(
+                    expression=expression.strip(),
+                    line=getattr(deco, "lineno", node.lineno),
+                    position=position,
+                )
+            )
+        return tuple(records)
 
     def _build_class_members(
         self, statement: ast.AST, *, file: DiscoveredFile, class_id: str

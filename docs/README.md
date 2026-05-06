@@ -25,8 +25,9 @@ for the elevator pitch, quickstart, and feature highlights.
 - [**Coder verification**](coder.md) — the optional 4th agent that
   re-reads the whole repository against each finding. Subprocess vs
   HTTP transport, multi-project workspace, verdict semantics.
-- [**Teaming mode**](teaming.md) — fan out each per-path stage to
-  multiple subagents with validator debate rounds.
+- [**Audit modes (`fast` / `deep`)**](audit-modes.md) — pick the
+  preset (or override per-stage replication and validator-debate
+  knobs directly).
 - [**Audit parallelism**](audit-parallelism.md) — `audit.worker_count`,
   inline vs subprocess pool, memory model, and resilience model.
 - [**Portal**](portal.md) — FastAPI + Next.js triage UI, login,

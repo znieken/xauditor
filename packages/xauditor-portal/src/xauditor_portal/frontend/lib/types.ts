@@ -1,4 +1,39 @@
-export type AuditMode = "single" | "team";
+export type AuditMode = "fast" | "deep";
+
+// `portal-coverage-panel`: per-run CoverageGaps payload mirroring the
+// xauditor-side `xauditor.coverage_gaps.CoverageGaps` dataclass JSONB
+// shape persisted on `audit_runs.coverage_gaps`.
+export interface CoverageGaps {
+  audited_classes: string[];
+  skipped_by_mode: string[];
+  out_of_scope: string[];
+  mode: "fast" | "deep";
+  advice_to_user: string;
+}
+
+// `portal-coverage-panel`: per-finding reconciliation payload mirroring
+// the xauditor-side `Finding.reconciliation` JSONB shape (Phase 5A's
+// PassthroughReconciler writes NULL; the AgenticReconciler from
+// `agentic-stage-runner-real` populates this).
+export interface PerUnitVerdict {
+  unit_kind: "path" | "sink" | "entry" | "state" | "boundary" | "config";
+  unit_id: string;
+  verdict: "Valid" | "Partial Valid" | "Inconclusive" | "False Positive" | "Refuted";
+  analysis: string;
+}
+
+export interface AgenticTranscriptEntry {
+  tool: string;
+  input: Record<string, unknown>;
+  output: string;
+}
+
+export interface Reconciliation {
+  per_unit_verdicts: PerUnitVerdict[];
+  consolidated_verdict: string;
+  consolidation_reasoning: string;
+  transcript?: AgenticTranscriptEntry[];
+}
 
 export type RunStatus =
   | "in_progress"
@@ -6,15 +41,22 @@ export type RunStatus =
   | "failed"
   | "cancelled";
 
+export type StagesForm = "prompt" | "agentic";
+
 export interface RunSummary {
   id: string;
   repo_root: string;
   project_name: string;
   build_fingerprint: string;
   mode: AuditMode;
+  // Stage-call form selected at run-open time (`audit.stages.form`).
+  // `prompt` routes through LangChain providers; `agentic` routes through
+  // xauditor-coder-service's /agent_invocations endpoint. Persisted on
+  // the run row (alembic 0014) so the portal can show it without
+  // inferring from downstream artifacts.
+  stages_form: StagesForm;
   status: RunStatus;
   progress_percent: number;
-  total_candidates: number;
   valid_findings: number;
   false_positives: number;
   unlabeled_findings: number;
@@ -35,8 +77,9 @@ export interface RunDetail extends RunSummary {
   report_dir: string | null;
   llm_providers_used: Record<string, unknown>;
   valid_findings_breakdown: FeedbackBreakdown;
-  false_positives_breakdown: FeedbackBreakdown;
   valid_rate: number | null;
+  // `portal-coverage-panel`: NULL on pre-Phase-5 runs.
+  coverage_gaps?: CoverageGaps | null;
 }
 
 export interface RunsPage {
@@ -205,6 +248,13 @@ export interface FindingDetail extends FindingSummary {
   coder_call_chain_evidence: CoderEvidence[];
   duplicate_of_finding_id?: string | null;
   duplicate_of?: DuplicateOfSummary | null;
+  // `portal-coverage-panel`: NULL on path-only / passthrough-reconciled
+  // findings. Populated when the agentic reconciler runs on multi-unit
+  // findings (depends on `agentic-stage-runner-real`).
+  reconciliation?: Reconciliation | null;
+  // NULL on prompt-form findings; populated when the agentic stage
+  // runner runs (`audit.stages.form: agentic`).
+  agentic_transcript?: AgenticTranscriptEntry[] | null;
 }
 
 export interface FeedbackPayload {
@@ -271,10 +321,10 @@ export interface ConfigSnapshot {
 export interface FindingFilters {
   file?: string;
   function?: string;
-  confidence?: string;
-  validation_status?: string;
-  exploitation_status?: string;
-  feedback_label?: FeedbackLabel;
+  confidence?: string[];
+  validation_status?: string[];
+  exploitation_status?: string[];
+  feedback_label?: FeedbackLabel[];
   q?: string;
 }
 

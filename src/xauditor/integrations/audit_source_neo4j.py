@@ -63,6 +63,22 @@ class Neo4jAuditGraphSource:
     ) -> tuple[tuple[ModuleSymbolRecord, ...], tuple[FunctionSymbolUseEdge, ...]]:
         return self._repository.load_symbols_for_functions(self.build_fingerprint, function_ids)
 
+    def fetch_decorators_for(self, function_ids: Sequence[str]):
+        # `capture-decorators-and-registrations` Phase 2.1 —
+        # delegate to the repository read method. Empty dict for
+        # graphs built before Commit A (the repository returns
+        # `{}` when no decorator rows exist for the function ids).
+        if not hasattr(self._repository, "fetch_decorators_for"):
+            return {}
+        return self._repository.fetch_decorators_for(function_ids)
+
+    def fetch_registrations_for(self, function_ids: Sequence[str]):
+        # `capture-decorators-and-registrations` Commit C —
+        # registration_context counterpart to fetch_decorators_for.
+        if not hasattr(self._repository, "fetch_registrations_for"):
+            return {}
+        return self._repository.fetch_registrations_for(function_ids)
+
     def build_coverage(
         self,
         *,

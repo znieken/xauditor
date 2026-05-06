@@ -91,9 +91,13 @@ Files whose language has no registered parser are still inventoried (coverage kn
 
 ## Highlights
 
-### Teaming mode for analyst-grade rigor
+### Audit modes — `fast` (CI) and `deep` (PSIRT)
 
-Run multiple subagents per stage with validator debate rounds — `Analyzer × 3 → Validator × 3 with debate → Exploiter × 2`, each subagent on a distinct provider. Cost scales with `sum(subagent_count)`. → [`docs/teaming.md`](docs/teaming.md)
+Set `audit.mode: fast` for CI / batch scans (single-replica prompt-driven chain, ~5-10K tokens per finding) or `audit.mode: deep` for analyst-grade reviews (3-replica analyzer + validator with debate, ~50-200K tokens per finding). The same `Analyzer → Validator → Exploiter` workflow drives both — only replication, debate, and the per-unit finding cap differ. → [`docs/audit-modes.md`](docs/audit-modes.md)
+
+### Coverage Gaps — every audit names what it didn't look at
+
+Every run emits a per-mode `Coverage Gaps` payload — Markdown section, JSON envelope field, and a portal Coverage panel above the findings list — naming the vulnerability classes the run actually covered, the classes a different `audit.mode` would have covered, and the classes outside xauditor's scope altogether. Fast-mode runs surface a CTA banner with the `xauditor audit run --mode deep` command for the classes only deep mode reaches; deep-mode runs that skip nothing show a quiet "audited / out-of-scope" pair. Answers the operator's reasonable post-audit question: *"the tool found nothing — what didn't it look at?"* → [`docs/audit-modes.md#coverage-gaps-phase-5`](docs/audit-modes.md#coverage-gaps-phase-5)
 
 ### Coder verification — a 4th agent that reads the whole repo
 
@@ -116,7 +120,7 @@ Single-VM docker-compose deployment that runs Neo4j + Postgres + portal + intern
 | LLM providers (`kind: openai` vs `kind: anthropic`) | [`docs/providers.md`](docs/providers.md) |
 | CLI reference (every command) | [`docs/cli.md`](docs/cli.md) |
 | Coder verification (4th agent) | [`docs/coder.md`](docs/coder.md) |
-| Teaming mode (multi-subagent + debate) | [`docs/teaming.md`](docs/teaming.md) |
+| Audit modes (`fast` / `deep`) | [`docs/audit-modes.md`](docs/audit-modes.md) |
 | Audit parallelism (`audit.worker_count`) | [`docs/audit-parallelism.md`](docs/audit-parallelism.md) |
 | Portal (web UI + Settings tab) | [`docs/portal.md`](docs/portal.md) |
 | Portal Settings page reference | [`docs/portal-settings.md`](docs/portal-settings.md) |

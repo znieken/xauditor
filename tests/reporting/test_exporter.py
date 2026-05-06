@@ -83,7 +83,7 @@ def _fixture_envelope_and_audit_run(
             "started_at": "2026-04-29T01:02:03+00:00",
             "completed_at": "2026-04-29T01:05:03+00:00",
             "status": "completed",
-            "mode": "single",
+            "mode": "fast",
             "llm_providers_used": {"auditor": "shared", "validator": "shared"},
             "totals": {
                 "candidates": 1,
@@ -156,6 +156,33 @@ class ExporterJsonEnvelopeTests(unittest.TestCase):
         )
         self.assertEqual(document["format_version"], "1")
         self.assertNotIn("debug", document)
+
+    def test_envelope_mode_field_passes_through_new_literals(self) -> None:
+        """`run.mode` is `"fast"` / `"deep"` after Phase 1 rename.
+
+        Snapshot test for `restructure-audit-modes-and-coverage`
+        Phase 1 task 1.6.7 — confirms the exporter does NOT
+        synthesize a mode value from anywhere else and faithfully
+        passes through the persisted column literal. Future
+        consumers (CI dashboards, RL training) can rely on
+        `{"fast", "deep"}` as the closed value set.
+        """
+
+        for mode_literal in ("fast", "deep"):
+            with self.subTest(mode=mode_literal):
+                envelope, audit_run = _fixture_envelope_and_audit_run()
+                envelope["run"]["mode"] = mode_literal
+                with patch(
+                    "xauditor.reporting.exporter._load_envelope_and_audit_run",
+                    return_value=(envelope, audit_run),
+                ):
+                    text = export_audit_run(
+                        config=None,  # type: ignore[arg-type]
+                        run_label="20260429-010203",
+                        fmt="json",
+                    )
+                document = json.loads(text)
+                self.assertEqual(document["run"]["mode"], mode_literal)
 
     def test_include_debug_emits_debug_top_level_key(self) -> None:
         envelope, audit_run = _fixture_envelope_and_audit_run(include_debug=True)

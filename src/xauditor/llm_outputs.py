@@ -122,6 +122,22 @@ if PYDANTIC_AVAILABLE:  # pragma: no cover - optional dependency path
             return _coerce_steps_to_string(value)
 
 
+    class ReconcilerOutput(_PydanticBaseModel):
+        """Cross-unit reconciler verdict.
+
+        Consumed by the agentic reconciler when multiple unit
+        kinds emit findings sharing the same fingerprint.
+        """
+
+        verdict: str = "Inconclusive"
+        reasoning: str = ""
+
+        @_pydantic_field_validator("reasoning", mode="before")
+        @classmethod
+        def _coerce_reasoning(cls, value):
+            return _coerce_steps_to_string(value)
+
+
 else:
     class _CompatModel:
         @classmethod
@@ -240,6 +256,12 @@ else:
         rebuttal: str
 
 
+    @dataclass(frozen=True)
+    class ReconcilerOutput(_CompatModel):
+        verdict: str = "Inconclusive"
+        reasoning: str = ""
+
+
 __all__ = [
     "AnalyzerOutput",
     "ClassSummaryOutput",
@@ -250,6 +272,7 @@ __all__ = [
     "OutputValidationError",
     "PYDANTIC_AVAILABLE",
     "PathSummaryOutput",
+    "ReconcilerOutput",
     "ValidationOutput",
     "ValidatorDebateOutput",
 ]

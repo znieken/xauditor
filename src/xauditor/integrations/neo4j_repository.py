@@ -37,6 +37,10 @@ class _StoredBuild:
     provenance: tuple["GraphProvenance", ...] = ()
     module_symbols: tuple["ModuleSymbolRecord", ...] = ()
     function_symbol_uses: tuple["FunctionSymbolUseEdge", ...] = ()
+    decorators: tuple["DecoratorRecord", ...] = ()
+    function_decorator_edges: tuple["FunctionDecoratorEdge", ...] = ()
+    registrations: tuple["RegistrationSiteRecord", ...] = ()
+    function_registration_edges: tuple["FunctionRegistrationEdge", ...] = ()
     coverage: "CoverageInventory | None" = None
     paths_truncated: bool = False
     paths_truncation_reason: str | None = None
@@ -88,14 +92,18 @@ from xauditor.models import (
     CoverageInventory,
     CoverageRecord,
     CoverageState,
+    DecoratorRecord,
     EdgeRecord,
     FileRecord,
+    FunctionDecoratorEdge,
     FunctionRecord,
+    FunctionRegistrationEdge,
     FunctionSymbolUseEdge,
     GraphProvenance,
     ModuleRecord,
     ModuleSymbolRecord,
     PathRecord,
+    RegistrationSiteRecord,
     RepositoryScope,
 )
 
@@ -340,7 +348,11 @@ class Neo4jGraphRepository:
             "RETURN fn.function_id AS function_id, fn.name AS name, fn.qualified_name AS qualified_name, "
             "fn.file_path AS file_path, fn.module_name AS module_name, fn.start_line AS start_line, "
             "fn.end_line AS end_line, fn.summary AS summary, fn.business_context AS business_context, "
-            "fn.trust_boundary AS trust_boundary, fn.class_id AS class_id "
+            "fn.trust_boundary AS trust_boundary, fn.class_id AS class_id, "
+            "fn.is_external AS is_external, "
+            "fn.is_well_known_sink AS is_well_known_sink, "
+            "fn.sink_kind AS sink_kind, "
+            "fn.mutates_self AS mutates_self "
             "ORDER BY fn.function_id",
             {"bf": build_fingerprint},
         )
@@ -358,6 +370,12 @@ class Neo4jGraphRepository:
                 business_context=row.get("business_context") or "",
                 trust_boundary=row.get("trust_boundary") or "",
                 class_id=row.get("class_id") or None,
+                # Defaults apply to graphs built before
+                # `capture-decorators-and-registrations` Commit 2.
+                is_external=bool(row.get("is_external") or False),
+                is_well_known_sink=bool(row.get("is_well_known_sink") or False),
+                sink_kind=row.get("sink_kind") or "",
+                mutates_self=bool(row.get("mutates_self") or False),
             )
             for row in rows
         )
@@ -560,7 +578,11 @@ class Neo4jGraphRepository:
             "RETURN fn.function_id AS function_id, fn.name AS name, fn.qualified_name AS qualified_name, "
             "fn.file_path AS file_path, fn.module_name AS module_name, fn.start_line AS start_line, "
             "fn.end_line AS end_line, fn.summary AS summary, fn.business_context AS business_context, "
-            "fn.trust_boundary AS trust_boundary, fn.class_id AS class_id",
+            "fn.trust_boundary AS trust_boundary, fn.class_id AS class_id, "
+            "fn.is_external AS is_external, "
+            "fn.is_well_known_sink AS is_well_known_sink, "
+            "fn.sink_kind AS sink_kind, "
+            "fn.mutates_self AS mutates_self",
             {"bf": build_fingerprint, "ids": list(function_ids)},
         )
         by_id = {
@@ -577,6 +599,10 @@ class Neo4jGraphRepository:
                 business_context=row.get("business_context") or "",
                 trust_boundary=row.get("trust_boundary") or "",
                 class_id=row.get("class_id") or None,
+                is_external=bool(row.get("is_external") or False),
+                is_well_known_sink=bool(row.get("is_well_known_sink") or False),
+                sink_kind=row.get("sink_kind") or "",
+                mutates_self=bool(row.get("mutates_self") or False),
             )
             for row in rows
         }
@@ -818,6 +844,18 @@ class Neo4jGraphRepository:
                 "class_key": _scoped_key(build_fingerprint, item.class_id) if item.class_id else "",
                 "file_key": _scoped_key(build_fingerprint, item.file_path),
                 "has_class": bool(item.class_id),
+                # `capture-decorators-and-registrations` Commit 2 —
+                # stub-vs-parsed marker + sink labelling. Defaults
+                # apply to records emitted by code that predates
+                # this change (those land False/"").
+                "is_external": item.is_external,
+                "is_well_known_sink": item.is_well_known_sink,
+                "sink_kind": item.sink_kind,
+                # `capture-decorators-and-registrations` Commit F —
+                # parser-detected `self.<x> = ...` flag for state
+                # enumeration. Defaults to False on pre-Commit-F
+                # records.
+                "mutates_self": item.mutates_self,
             }
             for item in records
         ]
@@ -830,7 +868,11 @@ class Neo4jGraphRepository:
             "fn.file_path = row.file_path, fn.module_name = row.module_name, "
             "fn.start_line = row.start_line, fn.end_line = row.end_line, "
             "fn.summary = row.summary, fn.business_context = row.business_context, "
-            "fn.trust_boundary = row.trust_boundary, fn.class_id = row.class_id",
+            "fn.trust_boundary = row.trust_boundary, fn.class_id = row.class_id, "
+            "fn.is_external = row.is_external, "
+            "fn.is_well_known_sink = row.is_well_known_sink, "
+            "fn.sink_kind = row.sink_kind, "
+            "fn.mutates_self = row.mutates_self",
             {"bf": build_fingerprint, "rows": rows},
         )
         # Class-declares-method edges for class-scoped functions.
@@ -941,6 +983,198 @@ class Neo4jGraphRepository:
             "r.confidence = row.confidence",
             {"rows": rows},
         )
+
+    def write_decorator_chunk(
+        self, build_fingerprint: str, records: Sequence[DecoratorRecord]
+    ) -> None:
+        """`capture-decorators-and-registrations` Phase 1.5.1.
+
+        MERGE keys: `(file_path, line_number, expression)` —
+        idempotent on re-graph-build, two decorators at the same
+        source location with the same expression are by
+        definition the same.
+        """
+
+        if not records:
+            return
+        rows = [
+            {
+                "decorator_key": _scoped_key(build_fingerprint, item.decorator_id),
+                "decorator_id": item.decorator_id,
+                "expression": item.expression,
+                "framework": item.framework,
+                "intent": item.intent,
+                "file_path": item.file_path,
+                "line_number": item.line_number,
+            }
+            for item in records
+        ]
+        self._write(
+            "UNWIND $rows AS row "
+            "MERGE (d:Decorator {decorator_key: row.decorator_key}) "
+            "SET d.build_fingerprint = $bf, d.decorator_id = row.decorator_id, "
+            "d.expression = row.expression, d.framework = row.framework, "
+            "d.intent = row.intent, d.file_path = row.file_path, "
+            "d.line_number = row.line_number",
+            {"bf": build_fingerprint, "rows": rows},
+        )
+
+    def write_function_decorator_edge_chunk(
+        self,
+        build_fingerprint: str,
+        records: Sequence[FunctionDecoratorEdge],
+    ) -> None:
+        """`capture-decorators-and-registrations` Phase 1.5.2.
+
+        Idempotent MERGE on `(:Function)-[:HAS_DECORATOR]->(:Decorator)`
+        edges with the `position` (bottom-up index) property.
+        """
+
+        if not records:
+            return
+        rows = [
+            {
+                "function_key": _scoped_key(build_fingerprint, item.function_id),
+                "decorator_key": _scoped_key(build_fingerprint, item.decorator_id),
+                "position": item.position,
+            }
+            for item in records
+        ]
+        self._write(
+            "UNWIND $rows AS row "
+            "MATCH (fn:Function {function_key: row.function_key}), "
+            "(d:Decorator {decorator_key: row.decorator_key}) "
+            "MERGE (fn)-[r:HAS_DECORATOR]->(d) "
+            "SET r.position = row.position",
+            {"rows": rows},
+        )
+
+    def write_registration_chunk(
+        self, build_fingerprint: str, records: Sequence[RegistrationSiteRecord]
+    ) -> None:
+        """`capture-decorators-and-registrations` Phase 1.5 / Commit C."""
+
+        if not records:
+            return
+        rows = [
+            {
+                "registration_key": _scoped_key(build_fingerprint, item.registration_id),
+                "registration_id": item.registration_id,
+                "framework": item.framework,
+                "intent": item.intent,
+                "expression": item.expression,
+                "file_path": item.file_path,
+                "line_number": item.line_number,
+            }
+            for item in records
+        ]
+        self._write(
+            "UNWIND $rows AS row "
+            "MERGE (r:RegistrationSite {registration_key: row.registration_key}) "
+            "SET r.build_fingerprint = $bf, r.registration_id = row.registration_id, "
+            "r.framework = row.framework, r.intent = row.intent, "
+            "r.expression = row.expression, r.file_path = row.file_path, "
+            "r.line_number = row.line_number",
+            {"bf": build_fingerprint, "rows": rows},
+        )
+
+    def write_function_registration_edge_chunk(
+        self,
+        build_fingerprint: str,
+        records: Sequence[FunctionRegistrationEdge],
+    ) -> None:
+        if not records:
+            return
+        rows = [
+            {
+                "registration_key": _scoped_key(build_fingerprint, item.registration_id),
+                "function_key": _scoped_key(build_fingerprint, item.function_id),
+            }
+            for item in records
+        ]
+        self._write(
+            "UNWIND $rows AS row "
+            "MATCH (r:RegistrationSite {registration_key: row.registration_key}), "
+            "(fn:Function {function_key: row.function_key}) "
+            "MERGE (r)-[:REGISTERS]->(fn)",
+            {"rows": rows},
+        )
+
+    def fetch_registrations_for(
+        self, function_ids: Sequence[str]
+    ) -> dict[str, list[RegistrationSiteRecord]]:
+        """Return `{function_id: [RegistrationSiteRecord ...]}`.
+
+        `capture-decorators-and-registrations` Phase 1.6.2.
+        Audit-time GraphSlice population reads this for the
+        `registration_context` field.
+        """
+
+        if not function_ids:
+            return {}
+        rows = self._rows(
+            "MATCH (r:RegistrationSite)-[:REGISTERS]->(fn:Function) "
+            "WHERE fn.function_id IN $ids "
+            "RETURN fn.function_id AS function_id, "
+            "r.registration_id AS registration_id, "
+            "r.framework AS framework, r.intent AS intent, "
+            "r.expression AS expression, r.file_path AS file_path, "
+            "r.line_number AS line_number "
+            "ORDER BY fn.function_id, r.line_number",
+            {"ids": list(function_ids)},
+        )
+        result: dict[str, list[RegistrationSiteRecord]] = {}
+        for row in rows:
+            fid = row["function_id"]
+            result.setdefault(fid, []).append(
+                RegistrationSiteRecord(
+                    registration_id=row["registration_id"],
+                    framework=row.get("framework") or "",
+                    intent=row.get("intent") or "",
+                    expression=row.get("expression") or "",
+                    file_path=row.get("file_path") or "",
+                    line_number=int(row.get("line_number") or 0),
+                )
+            )
+        return result
+
+    def fetch_decorators_for(
+        self, function_ids: Sequence[str]
+    ) -> dict[str, list[DecoratorRecord]]:
+        """Return `{function_id: [DecoratorRecord ordered by position]}`.
+
+        `capture-decorators-and-registrations` Phase 1.6.1. The
+        audit's GraphSlice population reads this to fill the
+        `decorator_chain` field.
+        """
+
+        if not function_ids:
+            return {}
+        rows = self._rows(
+            "MATCH (fn:Function)-[r:HAS_DECORATOR]->(d:Decorator) "
+            "WHERE fn.function_id IN $ids "
+            "RETURN fn.function_id AS function_id, "
+            "d.decorator_id AS decorator_id, d.expression AS expression, "
+            "d.framework AS framework, d.intent AS intent, "
+            "d.file_path AS file_path, d.line_number AS line_number, "
+            "r.position AS position "
+            "ORDER BY fn.function_id, r.position",
+            {"ids": list(function_ids)},
+        )
+        result: dict[str, list[DecoratorRecord]] = {}
+        for row in rows:
+            fid = row["function_id"]
+            result.setdefault(fid, []).append(
+                DecoratorRecord(
+                    decorator_id=row["decorator_id"],
+                    expression=row.get("expression") or "",
+                    framework=row.get("framework") or "",
+                    intent=row.get("intent") or "",
+                    file_path=row.get("file_path") or "",
+                    line_number=int(row.get("line_number") or 0),
+                )
+            )
+        return result
 
     def write_module_chunk(
         self, build_fingerprint: str, records: Sequence[ModuleRecord]
@@ -1241,6 +1475,91 @@ class InMemoryNeo4jGraphRepository:
         self, build_fingerprint: str, records: Sequence[FunctionRecord]
     ) -> None:
         self.adapter._extend_build(build_fingerprint, "functions", records)
+
+    def write_decorator_chunk(
+        self, build_fingerprint: str, records: Sequence[DecoratorRecord]
+    ) -> None:
+        self.adapter._extend_build(build_fingerprint, "decorators", records)
+
+    def write_function_decorator_edge_chunk(
+        self,
+        build_fingerprint: str,
+        records: Sequence[FunctionDecoratorEdge],
+    ) -> None:
+        self.adapter._extend_build(
+            build_fingerprint, "function_decorator_edges", records
+        )
+
+    def write_registration_chunk(
+        self,
+        build_fingerprint: str,
+        records: Sequence[RegistrationSiteRecord],
+    ) -> None:
+        self.adapter._extend_build(build_fingerprint, "registrations", records)
+
+    def write_function_registration_edge_chunk(
+        self,
+        build_fingerprint: str,
+        records: Sequence[FunctionRegistrationEdge],
+    ) -> None:
+        self.adapter._extend_build(
+            build_fingerprint, "function_registration_edges", records
+        )
+
+    def fetch_registrations_for(
+        self, function_ids: Sequence[str]
+    ) -> dict[str, list[RegistrationSiteRecord]]:
+        if not function_ids:
+            return {}
+        function_id_set = set(function_ids)
+        site_by_id: dict[str, RegistrationSiteRecord] = {}
+        for build in self.adapter.builds_by_fingerprint.values():
+            for site in build.registrations:
+                site_by_id[site.registration_id] = site
+        result: dict[str, list[RegistrationSiteRecord]] = {}
+        for build in self.adapter.builds_by_fingerprint.values():
+            for edge in build.function_registration_edges:
+                if edge.function_id not in function_id_set:
+                    continue
+                site = site_by_id.get(edge.registration_id)
+                if site is None:
+                    continue
+                result.setdefault(edge.function_id, []).append(site)
+        return result
+
+    def fetch_decorators_for(
+        self, function_ids: Sequence[str]
+    ) -> dict[str, list[DecoratorRecord]]:
+        if not function_ids:
+            return {}
+        # Find the build holding these function ids — every build
+        # in the in-memory adapter is independent so we walk all
+        # of them.
+        function_id_set = set(function_ids)
+        decorator_by_id: dict[str, DecoratorRecord] = {}
+        for build in self.adapter.builds_by_fingerprint.values():
+            for d in build.decorators:
+                decorator_by_id[d.decorator_id] = d
+        result: dict[str, list[DecoratorRecord]] = {}
+        for build in self.adapter.builds_by_fingerprint.values():
+            for edge in build.function_decorator_edges:
+                if edge.function_id not in function_id_set:
+                    continue
+                deco = decorator_by_id.get(edge.decorator_id)
+                if deco is None:
+                    continue
+                result.setdefault(edge.function_id, []).append(deco)
+        # Sort each list by position via the edge metadata.
+        for fid in result:
+            edges = [
+                edge
+                for build in self.adapter.builds_by_fingerprint.values()
+                for edge in build.function_decorator_edges
+                if edge.function_id == fid
+            ]
+            order = {edge.decorator_id: edge.position for edge in edges}
+            result[fid].sort(key=lambda d: order.get(d.decorator_id, 0))
+        return result
 
     def write_module_chunk(
         self, build_fingerprint: str, records: Sequence[ModuleRecord]

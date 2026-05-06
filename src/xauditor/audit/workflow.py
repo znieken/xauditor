@@ -19,9 +19,20 @@ from xauditor.audit.agents import (
     ValidatorTeam,
 )
 from xauditor.audit._cancellation import RunCancellation
+from xauditor.audit.agent_transport import AgentTransport
 from xauditor.audit.coder import CoderDispatcher, CoderResult, render_coder_payload
-from xauditor.audit.context import build_path_context
+from xauditor.audit.context import build_graph_slice
+from xauditor.audit.reconciler import (
+    PassthroughReconciler,
+    Reconciler,
+    build_reconciler,
+)
 from xauditor.audit.source import AuditGraphSource
+from xauditor.audit.stage_runner import (
+    PromptStageRunner,
+    StageRunner,
+    build_stage_runner,
+)
 from xauditor.audit.worker_pool import (
     PathOutcome,
     PathResult,
@@ -134,6 +145,66 @@ def _shutdown_pool_with_deadline(
             pass
 
 
+def _matches_any_excluded(
+    candidate: AnalyzerResult,
+    accepted_chain: list[
+        tuple[AnalyzerResult, "ExploitationResult | None", "ValidationResult | None", bool]
+    ],
+) -> bool:
+    """True iff *candidate* matches any already-accepted entry on the
+    exact-match key ``(finding_name, suspect_function_id, suspect_line)``.
+
+    Used by the fast-mode iterative analyzer loop as a defense against
+    a misbehaving model that returns a "new" candidate whose key
+    matches an entry the loop already passed via ``excluded_findings``.
+    """
+    key = (
+        (candidate.finding_name or "").strip().casefold(),
+        (candidate.suspect_function_id or "").strip(),
+        int(candidate.suspect_line or 0),
+    )
+    for entry in accepted_chain:
+        existing = entry[0]
+        existing_key = (
+            (existing.finding_name or "").strip().casefold(),
+            (existing.suspect_function_id or "").strip(),
+            int(existing.suspect_line or 0),
+        )
+        if existing_key == key:
+            return True
+    return False
+
+
+def _resolve_runtime_coder_cfg(coder_cfg, *, repo_root):
+    """Return ``coder_cfg`` with ``effective_project_name`` filled in
+    from ``coder.workspace_root + repo_root`` when the operator did
+    not set ``coder.project_name`` explicitly.
+
+    Without this, ``HttpCoderTransport`` reads the empty
+    ``effective_project_name`` and POSTs ``project=""`` to coder-
+    service, which routes claude into ``/workspace`` (the whole
+    bind mount, ie. every audit-able repo on the host) instead of
+    ``/workspace/<project>`` (the audit target only). The end
+    result: claude's ``find /workspace -name '*.py'`` tool calls
+    walk every project's ``node_modules`` etc., taking minutes per
+    verification on slow filesystems.
+
+    Mirrors what the agentic transport already does
+    (``build_stage_runner`` calls
+    ``preflight.derive_project_from_workspace`` for the same
+    purpose); this helper closes the gap for the verification
+    coder path.
+    """
+    from xauditor.audit.preflight import resolve_coder_project
+
+    if coder_cfg.effective_project_name:
+        return coder_cfg
+    derived = resolve_coder_project(coder_cfg, repo_root=repo_root)
+    if not derived:
+        return coder_cfg
+    return replace(coder_cfg, effective_project_name=derived)
+
+
 def _is_neo4j_transport_error(exc: BaseException) -> bool:
     """True iff ``exc`` is a recoverable Neo4j connection failure.
 
@@ -166,25 +237,47 @@ class AuditWorkflow:
         validator_team: ValidatorTeam | None = None,
         exploiter_team: ExploiterTeam | None = None,
         coder_dispatcher: CoderDispatcher | None = None,
+        stage_runner: StageRunner | None = None,
+        reconciler: Reconciler | None = None,
+        agent_transport: AgentTransport | None = None,
         logger: RuntimeLogger | None = None,
         cancellation: "RunCancellation | None" = None,
     ) -> None:
         self.config = config
         self.llm_client = llm_client
-        self.teaming_enabled = bool(config.teaming.enabled)
+        # `teaming_enabled` retains its name for now (rename to
+        # `deep_mode_enabled` is a separate follow-up commit). The
+        # source moved from `config.teaming.enabled` to
+        # `config.audit_mode.mode == "deep"` in Phase 1B.
+        self.teaming_enabled = config.audit_mode.mode == "deep"
         self.analyzer_agent = analyzer_agent or AnalyzerAgent()
         self.exploitation_agent = exploitation_agent or ExploitationAgent()
         self.validator_agent = validator_agent or ValidatorAgent()
         self.analyzer_team = analyzer_team
         self.validator_team = validator_team
         self.exploiter_team = exploiter_team
+        # `wire-agentic-into-workflow` Phase 1 — every per-stage call
+        # routes through a `StageRunner` Protocol so
+        # `audit.stages.form: agentic` actually exercises the
+        # CoderServiceAgentTransport. When the caller doesn't supply
+        # a stage_runner (test paths), fall back to a
+        # `PromptStageRunner` wrapping the supplied agents — preserves
+        # today's behaviour exactly.
+        self.stage_runner: StageRunner = stage_runner or PromptStageRunner(
+            analyzer_agent=self.analyzer_agent,
+            validator_agent=self.validator_agent,
+            exploitation_agent=self.exploitation_agent,
+            logger=logger,
+        )
+        self.reconciler: Reconciler = reconciler or PassthroughReconciler()
+        self.agent_transport = agent_transport
         if self.teaming_enabled and (
             self.analyzer_team is None
             or self.validator_team is None
             or self.exploiter_team is None
         ):
             raise ValueError(
-                "AuditWorkflow: teaming.enabled is true but one or more teams are missing."
+                "AuditWorkflow: audit.mode is deep but one or more teams are missing."
             )
         self.coder_dispatcher = coder_dispatcher
         self.coder_enabled = bool(config.coder.enabled) and coder_dispatcher is not None
@@ -239,24 +332,101 @@ class AuditWorkflow:
         else:
             exploitation_model = auditor_model
         validator_model = resolve_chat_model(config.llm, agent="validator")
-        analyzer_team = validator_team = exploiter_team = None
-        if config.teaming.enabled:
-            analyzer_team = AnalyzerTeam(teaming=config.teaming, llm=config.llm, logger=logger)
-            validator_team = ValidatorTeam(teaming=config.teaming, llm=config.llm, logger=logger)
-            exploiter_team = ExploiterTeam(teaming=config.teaming, llm=config.llm, logger=logger)
         coder_dispatcher: CoderDispatcher | None = None
         if with_coder and config.coder.enabled:
-            coder_dispatcher = CoderDispatcher.from_config(config.coder, logger=logger)
+            coder_cfg_runtime = _resolve_runtime_coder_cfg(
+                config.coder, repo_root=config.repo_root
+            )
+            coder_dispatcher = CoderDispatcher.from_config(
+                coder_cfg_runtime, logger=logger
+            )
+        analyzer_agent_inst = AnalyzerAgent(chat_model=auditor_model, logger=logger)
+        validator_agent_inst = ValidatorAgent(chat_model=validator_model, logger=logger)
+        exploitation_agent_inst = ExploitationAgent(chat_model=exploitation_model, logger=logger)
+        # `wire-agentic-into-workflow` Phase 1 — build (stage_runner,
+        # transport) before constructing the workflow so they land on
+        # the right config (audit.stages.form +
+        # audit.agentic.transport.coder_service.*). The transport is
+        # forwarded to build_reconciler so both share a single
+        # underlying CoderServiceAgentTransport instance under
+        # `stages.form: agentic`.
+        stage_runner_inst, agent_transport_inst = build_stage_runner(
+            audit_mode=config.audit_mode,
+            analyzer_agent=analyzer_agent_inst,
+            validator_agent=validator_agent_inst,
+            exploitation_agent=exploitation_agent_inst,
+            logger=logger,
+            coder_cfg=config.coder,
+            repo_root=config.repo_root,
+        )
+        reconciler_inst = build_reconciler(
+            audit_mode=config.audit_mode,
+            transport=agent_transport_inst,
+        )
+
+        analyzer_team = validator_team = exploiter_team = None
+        if config.audit_mode.mode == "deep":
+            # `wire-agentic-into-workflow` Phase 2 — when stages.form
+            # is agentic, push the AgenticStageRunner (built above)
+            # into AnalyzerTeam + ExploiterTeam so per-replica
+            # `_invoke(...)` dispatches through coder-service instead
+            # of constructing per-replica per-provider AnalyzerAgent /
+            # ExploitationAgent instances. ValidatorTeam stays
+            # prompt-form for now — its multi-round debate machinery
+            # doesn't fit one-shot agentic dispatch and re-platforming
+            # it deserves its own change.
+            agentic_form = (
+                getattr(config.audit_mode, "stages_form", "prompt") == "agentic"
+            )
+            analyzer_personas: tuple = ()
+            exploiter_personas: tuple = ()
+            agentic_runner_for_teams: object | None = None
+            if agentic_form:
+                from xauditor.audit.stage_runner import resolve_personas
+                analyzer_personas = resolve_personas(
+                    config.audit_mode.personas,
+                    config.audit_mode.replication.analyzer,
+                )
+                exploiter_personas = resolve_personas(
+                    config.audit_mode.personas,
+                    config.audit_mode.replication.exploiter,
+                )
+                agentic_runner_for_teams = stage_runner_inst
+            analyzer_team = AnalyzerTeam(
+                stage_cfg=config.audit_mode.analyzer,
+                replication=config.audit_mode.replication.analyzer,
+                llm=config.llm,
+                logger=logger,
+                agentic_stage_runner=agentic_runner_for_teams,
+                personas=analyzer_personas,
+            )
+            validator_team = ValidatorTeam(
+                stage_cfg=config.audit_mode.validator,
+                replication=config.audit_mode.replication.validator,
+                llm=config.llm,
+                logger=logger,
+            )
+            exploiter_team = ExploiterTeam(
+                stage_cfg=config.audit_mode.exploiter,
+                replication=config.audit_mode.replication.exploiter,
+                llm=config.llm,
+                logger=logger,
+                agentic_stage_runner=agentic_runner_for_teams,
+                personas=exploiter_personas,
+            )
         return cls(
             config=config,
             llm_client=LLMClient.from_config(config.llm, logger=logger, agent="auditor"),
-            analyzer_agent=AnalyzerAgent(chat_model=auditor_model, logger=logger),
-            exploitation_agent=ExploitationAgent(chat_model=exploitation_model, logger=logger),
-            validator_agent=ValidatorAgent(chat_model=validator_model, logger=logger),
+            analyzer_agent=analyzer_agent_inst,
+            exploitation_agent=exploitation_agent_inst,
+            validator_agent=validator_agent_inst,
             analyzer_team=analyzer_team,
             validator_team=validator_team,
             exploiter_team=exploiter_team,
             coder_dispatcher=coder_dispatcher,
+            stage_runner=stage_runner_inst,
+            reconciler=reconciler_inst,
+            agent_transport=agent_transport_inst,
             logger=logger,
             cancellation=cancellation,
         )
@@ -433,6 +603,15 @@ class AuditWorkflow:
                     shared_state[fp] = path_shared_state
                     checkpoints[fp] = result.checkpoint_status
                     finding_index_in_path = 0
+                    # `wire-agentic-into-workflow` Phase 3 — per-unit
+                    # agentic transcript drained at the end of
+                    # `_process_unit_*` and stashed on path_shared_state
+                    # for every finding on this unit to share. Empty
+                    # tuple under prompt mode (PromptStageRunner's
+                    # `pop_transcripts_for(...)` is a no-op).
+                    agentic_transcript_for_unit = tuple(
+                        path_shared_state.get("agentic_transcript", ())
+                    )
                     for analyzer, exploitation, validator, is_candidate in result.per_finding:
                         if not is_candidate:
                             continue
@@ -444,6 +623,7 @@ class AuditWorkflow:
                             exploitation=exploitation,
                             validator=validator,
                             referenced_symbols=path_context.get("referenced_symbols", ()),
+                            agentic_transcript=agentic_transcript_for_unit,
                         )
                         if finding is not None:
                             if self.coder_enabled and self.coder_dispatcher is not None:
@@ -627,6 +807,18 @@ class AuditWorkflow:
             index=total_units,
             message=f"All {total_units} paths processed",
         )
+        # `wire-agentic-into-workflow` Phase 3 — run cross-unit
+        # reconciliation once now that every per-unit chain has
+        # completed and findings have streamed to the live sink.
+        # `PassthroughReconciler` is structurally a no-op for path-
+        # only audits (today's planner output) but still produces a
+        # complete reconciliation payload (one per_unit_verdict
+        # entry per finding) so the portal Per-Unit Verdicts panel
+        # has data to render in the single-unit case. For multi-
+        # unit findings under `audit.stages.form: agentic`, the
+        # `AgenticReconciler` invokes the `reconciler` v1 prompt
+        # via the same coder-service transport.
+        self._apply_reconciliation(findings, on_finding_upsert)
         return self._build_audit_run(
             source=source,
             audit_units=tuple(completed_units),
@@ -636,6 +828,60 @@ class AuditWorkflow:
             skipped_paths=set(context_skipped_paths),
             failed_paths=set(failed_paths),
         )
+
+    def _apply_reconciliation(
+        self,
+        findings: list[Finding],
+        on_finding_upsert: Callable[[Finding], None] | None,
+    ) -> None:
+        """Run `self.reconciler.reconcile(findings)` and stamp each
+        finding's `reconciliation` field with the reconciler's
+        `to_payload()` dict. Mutates `findings` in-place (replacing
+        each entry with `dataclasses.replace(finding,
+        reconciliation=payload)`). Re-emits `on_finding_upsert` for
+        findings that gained a non-empty payload so the Postgres
+        sink writes the alembic-0012 column.
+
+        Catches reconciler exceptions and logs — findings keep
+        `reconciliation: None` and the audit run still completes.
+        Reviewer just doesn't see the Per-Unit Verdicts panel for
+        that run.
+        """
+
+        if not findings:
+            return
+        try:
+            reconciled = self.reconciler.reconcile(list(findings))
+        except Exception as exc:  # noqa: BLE001 - reconciliation must not fail the run
+            if self.logger is not None:
+                self.logger.warning(
+                    f"Reconciler raised; findings keep reconciliation=None: {exc}"
+                )
+            return
+
+        # Build a lookup: finding_id → reconciliation payload.
+        payload_by_id: dict[str, dict[str, object]] = {}
+        for rf in reconciled:
+            payload = rf.to_payload()
+            # PassthroughReconciler always returns 1 finding per group
+            # (the `members[0]` for that fingerprint group); the same
+            # finding_id maps to the same payload.
+            payload_by_id[rf.finding.finding_id] = payload
+
+        for idx, finding in enumerate(findings):
+            payload = payload_by_id.get(finding.finding_id)
+            if payload is None:
+                continue
+            updated = replace(finding, reconciliation=payload)
+            findings[idx] = updated
+            if on_finding_upsert is not None:
+                try:
+                    on_finding_upsert(updated)
+                except Exception as exc:  # noqa: BLE001 - sink resilience
+                    if self.logger is not None:
+                        self.logger.warning(
+                            f"on_finding_upsert raised after reconciliation: {exc}"
+                        )
 
     def _process_one_path(
         self,
@@ -678,12 +924,39 @@ class AuditWorkflow:
             unit = self._enrich_unit(candidate_unit)
             path_functions = source.load_path_functions(unit.function_ids)
             module_symbols, function_symbol_uses = source.load_path_symbols(unit.function_ids)
-            path_context = build_path_context(
+            # Phase 2A: build a `GraphSlice` and project to the legacy
+            # dict shape so existing stage payload consumers
+            # (`audit/agents.py`, `_dispatch_coder`) keep working
+            # unchanged. The new GraphSlice fields are populated only
+            # when `audit.graph_slice` is on (default true).
+            # `capture-decorators-and-registrations` Commit B —
+            # fetch the per-function decorator chain when the v2
+            # GraphSlice flag is on. The source returns `{}` for
+            # legacy graphs / sources that don't carry decorator
+            # data; build_graph_slice treats absence as
+            # decorator_chain=().
+            decorators_by_function_id = (
+                source.fetch_decorators_for(unit.function_ids)
+                if self.config.audit_mode.graph_slice
+                else {}
+            )
+            registrations_by_function_id = (
+                source.fetch_registrations_for(unit.function_ids)
+                if self.config.audit_mode.graph_slice
+                else {}
+            )
+            graph_slice = build_graph_slice(
                 repo_root=self.config.repo_root,
                 path_functions=path_functions,
                 module_symbols=module_symbols,
                 function_symbol_uses=function_symbol_uses,
+                enable_v2_fields=bool(
+                    self.config.audit_mode.graph_slice
+                ),
+                decorators_by_function_id=decorators_by_function_id,
+                registrations_by_function_id=registrations_by_function_id,
             )
+            path_context = graph_slice.to_payload_dict()
             if self._cancelling.is_set():
                 return PathResult(
                     index=index,
@@ -802,7 +1075,7 @@ class AuditWorkflow:
             "sampling": sampling.as_manifest(),
         }
 
-    def _teaming_model_settings(self, team_cfg, *, role: str, records) -> list[dict[str, object]]:
+    def _teaming_model_settings(self, *, role: str, records) -> list[dict[str, object]]:
         override = self.config.llm.agent_overrides.get(role)
         entries: list[dict[str, object]] = []
         for record in records:
@@ -838,80 +1111,334 @@ class AuditWorkflow:
         dict[str, object],
         str,
     ]:
-        analyzer = self.analyzer_agent.run(
-            unit=unit, path_functions=path_functions, path_context=path_context
-        )
-        if self.logger is not None:
-            self.logger.debug_kv(
-                "Analyzer completed",
-                path=unit.path.path_fingerprint,
-                status=analyzer.status,
-                evidence=analyzer.evidence_strength,
-                reason=analyzer.reason,
-            )
-        analyzer_payload = self._analyzer_payload(
-            analyzer=analyzer, path_functions=path_functions
-        )
+        """Run the per-unit single-replica chain with iterative analyzer.
+
+        After ``restructure-audit-modes-and-coverage`` Phase 1B:
+
+        - Stage order is **Analyzer → Validator → Exploiter** (validator
+          no longer sees exploitation context).
+        - Validator-confirmed findings (``Valid`` / ``Partial Valid`` /
+          ``Inconclusive``) trigger the exploiter; ``False Positive``
+          short-circuits and the exploiter is skipped (a placeholder
+          ``status="skipped"`` exploitation block is recorded so the
+          finding card still reads as a complete audit unit).
+        - The exploiter MAY return ``status="not_exploitable"``, in
+          which case the workflow downgrades a ``Valid`` verdict to
+          ``Partial Valid`` and prepends the exploiter's reason to
+          the validation analysis (with a clear marker). The
+          validator is NOT re-invoked on the downgrade.
+        - The analyzer is invoked iteratively with an
+          ``excluded_findings`` summary list of every accepted
+          candidate so far. The loop terminates when (a) the analyzer
+          returns ``status != "candidate"`` twice consecutively, OR
+          (b) the count of accepted findings reaches
+          ``audit.max_findings_per_unit`` (default ``3``). Each
+          surviving candidate produces one tuple in ``per_finding``;
+          the workflow's existing aggregator iterates them
+          downstream.
+
+        Iteration metadata (round count, accepted-key list,
+        next-round excluded list, terminated_by) is persisted to
+        ``path_shared_state["analyzer_iterations"]`` so
+        ``services.resume_audit`` can continue an interrupted loop
+        from the next round rather than re-evaluating the
+        already-accepted candidates.
+        """
+
+        cap = max(1, int(self.config.audit_mode.max_findings_per_unit))
         single_model_settings = {
             "analyzer": self._model_settings_for_role("auditor"),
             "exploitation": self._model_settings_for_role("exploitation"),
             "validator": self._model_settings_for_role("validator"),
         }
-        if analyzer.status != "candidate":
+
+        accepted_chain: list[tuple[AnalyzerResult, ExploitationResult | None, ValidationResult | None, bool]] = []
+        accepted_payloads: list[dict[str, object]] = []
+        analyzer_only_outputs: list[dict[str, object]] = []  # for resume metadata
+        terminated_by: str | None = None
+        consecutive_no_issue = 0
+        round_index = 0
+
+        while len(accepted_chain) < cap and consecutive_no_issue < 2:
+            round_index += 1
+            excluded_keys = tuple(
+                {
+                    "finding_name": entry[0].finding_name,
+                    "suspect_function_id": entry[0].suspect_function_id,
+                    "suspect_line": entry[0].suspect_line,
+                }
+                for entry in accepted_chain
+            )
+            analyzer = self.stage_runner.run_analyzer(
+                unit=unit,
+                path_functions=path_functions,
+                path_context=path_context,
+                excluded_findings=excluded_keys,
+            )
             if self.logger is not None:
                 self.logger.debug_kv(
-                    "Downstream agents skipped",
+                    "Analyzer completed",
                     path=unit.path.path_fingerprint,
-                    reason="analyzer reported no finding",
-                    analyzer_status=analyzer.status,
+                    round=round_index,
+                    status=analyzer.status,
+                    evidence=analyzer.evidence_strength,
+                    excluded_count=len(excluded_keys),
+                    reason=analyzer.reason,
                 )
-            exploitation_payload = {
-                "status": "skipped",
-                "steps": "Skipped because analyzer did not report a candidate finding.",
-            }
-            validator_payload = {
-                "status": "skipped",
-                "analysis": "Skipped because analyzer did not report a candidate finding.",
+            analyzer_only_outputs.append(
+                self._analyzer_payload(analyzer=analyzer, path_functions=path_functions)
+            )
+            if analyzer.status != "candidate":
+                consecutive_no_issue += 1
+                continue
+
+            # Defense against a misbehaving model that returns a
+            # candidate matching one we already excluded — count it
+            # as a no_issue for the round so the loop can still
+            # converge.
+            if _matches_any_excluded(analyzer, accepted_chain):
+                consecutive_no_issue += 1
+                if self.logger is not None:
+                    self.logger.warning(
+                        "analyzer returned excluded candidate; treating as no_issue "
+                        f"(path={unit.path.path_fingerprint}, round={round_index}, "
+                        f"finding_name={analyzer.finding_name!r})"
+                    )
+                continue
+
+            # Run the validator → exploiter chain for THIS candidate.
+            validator = self.stage_runner.run_validator(
+                unit=unit, analyzer=analyzer, path_context=path_context,
+            )
+            if self.logger is not None:
+                self.logger.debug_kv(
+                    "Validator verdict",
+                    path=unit.path.path_fingerprint,
+                    round=round_index,
+                    status=validator.status.value,
+                    analysis=validator.analysis,
+                )
+            if validator.status == ValidationStatus.FALSE_POSITIVE:
+                # Skip the exploiter for FP findings; record a
+                # placeholder so the downstream finding card still
+                # has a complete shape.
+                exploitation_for_fp = ExploitationResult(
+                    status="skipped",
+                    steps="Skipped because validator marked the finding as False Positive.",
+                )
+                accepted_chain.append((analyzer, exploitation_for_fp, validator, True))
+                accepted_payloads.append(
+                    {
+                        "analyzer": self._analyzer_payload(
+                            analyzer=analyzer, path_functions=path_functions
+                        ),
+                        "exploitation": {
+                            "status": exploitation_for_fp.status,
+                            "steps": exploitation_for_fp.steps,
+                        },
+                        "validator": {
+                            "status": validator.status.value,
+                            "analysis": validator.analysis,
+                        },
+                    }
+                )
+                consecutive_no_issue = 0
+                continue
+
+            exploitation = self.stage_runner.run_exploiter(
+                unit=unit,
+                analyzer=analyzer,
+                validator=validator,
+                path_context=path_context,
+            )
+            if self.logger is not None:
+                self.logger.debug_kv(
+                    "Exploitation completed",
+                    path=unit.path.path_fingerprint,
+                    round=round_index,
+                    status=exploitation.status,
+                )
+
+            # ``not_exploitable`` feedback channel: downgrade a Valid
+            # verdict to Partial Valid and prepend the exploiter's
+            # reason to the validation analysis. The validator is NOT
+            # re-invoked. This is the workflow-side honouring of the
+            # exploiter's "I tried to construct an attack and the
+            # preconditions don't hold" signal.
+            if (
+                exploitation.status == "not_exploitable"
+                and validator.status == ValidationStatus.VALID
+            ):
+                downgrade_marker = (
+                    "[exploiter downgrade] "
+                    + (exploitation.steps or "exploiter declared not_exploitable")
+                )
+                validator = ValidationResult(
+                    status=ValidationStatus.PARTIAL_VALID,
+                    analysis=(
+                        f"{downgrade_marker}\n\n{validator.analysis}"
+                        if validator.analysis
+                        else downgrade_marker
+                    ),
+                )
+                if self.logger is not None:
+                    self.logger.debug_kv(
+                        "Validator verdict downgraded by exploiter not_exploitable",
+                        path=unit.path.path_fingerprint,
+                        round=round_index,
+                        new_status=validator.status.value,
+                    )
+
+            accepted_chain.append((analyzer, exploitation, validator, True))
+            accepted_payloads.append(
+                {
+                    "analyzer": self._analyzer_payload(
+                        analyzer=analyzer, path_functions=path_functions
+                    ),
+                    "exploitation": {"status": exploitation.status, "steps": exploitation.steps},
+                    "validator": {"status": validator.status.value, "analysis": validator.analysis},
+                }
+            )
+            consecutive_no_issue = 0
+
+        # Terminated the loop — record why.
+        if len(accepted_chain) >= cap:
+            terminated_by = "cap"
+            if self.logger is not None:
+                self.logger.warning(
+                    f"max_findings_per_unit cap reached "
+                    f"(path={unit.path.path_fingerprint}, cap={cap}); "
+                    "additional candidate findings on this unit may exist. "
+                    "Raise audit.max_findings_per_unit or switch to deep mode "
+                    "if completeness matters here."
+                )
+        elif consecutive_no_issue >= 2:
+            terminated_by = "convergence"
+
+        # `wire-agentic-into-workflow` Phase 3 — drain per-unit
+        # transcripts from the stage runner now that the per-stage
+        # chain has completed for this unit. PromptStageRunner
+        # returns `()` (no transcripts under prompt mode);
+        # AgenticStageRunner returns the accumulated per-call
+        # transcripts. The MVP attaches the SAME drained list to
+        # every finding produced for this unit (per-unit
+        # attribution); per-finding attribution is a follow-up.
+        # `unit.unit_id` exists on the new `AuditUnit` Protocol
+        # (units.py); legacy `models.AuditUnit` callers don't have
+        # it, so fall back to the path fingerprint (the stable
+        # unit identifier today).
+        unit_id = getattr(unit, "unit_id", None) or unit.path.path_fingerprint
+        agentic_transcript_for_unit: tuple[dict[str, object], ...] = (
+            self.stage_runner.pop_transcripts_for(unit_id)
+        )
+
+        # Build the per_finding tuple list expected by the aggregator.
+        # Empty acceptance → keep today's "no_finding placeholder"
+        # shape so resume / sink code paths stay unchanged.
+        if not accepted_chain:
+            placeholder_analyzer = (
+                # If the loop ran at least once, surface the LAST
+                # analyzer-only output as the no_finding placeholder
+                # for downstream context. Otherwise emit a synthetic
+                # "no_issue" record (defensive — the loop always runs
+                # at least once because cap >= 1).
+                AnalyzerResult(status="no_issue")
+            )
+            shared_state: dict[str, object] = {
+                "analyzer": (
+                    analyzer_only_outputs[-1]
+                    if analyzer_only_outputs
+                    else self._analyzer_payload(
+                        analyzer=placeholder_analyzer, path_functions=path_functions
+                    )
+                ),
+                "exploitation": {
+                    "status": "skipped",
+                    "steps": "Skipped because analyzer did not report a candidate finding.",
+                },
+                "validator": {
+                    "status": "skipped",
+                    "analysis": "Skipped because analyzer did not report a candidate finding.",
+                },
+                "model_settings": single_model_settings,
+                "analyzer_iterations": {
+                    "round_count": round_index,
+                    "accepted": [],
+                    "next_round_excluded": [],
+                    "terminated_by": terminated_by or "convergence",
+                },
+                "agentic_transcript": agentic_transcript_for_unit,
             }
             return (
-                [(analyzer, None, None, False)],
-                {
-                    "analyzer": analyzer_payload,
-                    "exploitation": exploitation_payload,
-                    "validator": validator_payload,
-                    "model_settings": single_model_settings,
-                },
+                [(placeholder_analyzer, None, None, False)],
+                shared_state,
                 "no_finding",
             )
-        exploitation = self.exploitation_agent.run(
-            unit=unit, analyzer=analyzer, path_context=path_context
+
+        # ``checkpoint_status`` is the worst-case verdict across the
+        # accepted chain (Valid wins over FP for the per-unit
+        # checkpoint label, matching today's single-finding behavior).
+        # A unit with one Valid + one FP checkpoint-labels as Valid.
+        checkpoint_status = self._aggregate_checkpoint_status(
+            entry[2].status for entry in accepted_chain if entry[2] is not None
         )
-        if self.logger is not None:
-            self.logger.debug_kv(
-                "Exploitation completed",
-                path=unit.path.path_fingerprint,
-                status=exploitation.status,
-            )
-        validator = self.validator_agent.run(
-            unit=unit, analyzer=analyzer, exploitation=exploitation, path_context=path_context
-        )
-        if self.logger is not None:
-            self.logger.debug_kv(
-                "Validator verdict",
-                path=unit.path.path_fingerprint,
-                status=validator.status.value,
-                analysis=validator.analysis,
-            )
-        return (
-            [(analyzer, exploitation, validator, True)],
-            {
-                "analyzer": analyzer_payload,
-                "exploitation": {"status": exploitation.status, "steps": exploitation.steps},
-                "validator": {"status": validator.status.value, "analysis": validator.analysis},
-                "model_settings": single_model_settings,
+
+        # ``shared_state`` keys (analyzer/exploitation/validator) hold
+        # the FIRST accepted finding's per-stage payload to preserve
+        # backward compatibility with the existing dispatch /
+        # rendering code that assumes one-finding-per-unit. Multi-
+        # finding callers consult ``analyzer_iterations.accepted``
+        # for the full ordered list.
+        shared_state = {
+            "analyzer": accepted_payloads[0]["analyzer"],
+            "exploitation": accepted_payloads[0]["exploitation"],
+            "validator": accepted_payloads[0]["validator"],
+            "model_settings": single_model_settings,
+            "analyzer_iterations": {
+                "round_count": round_index,
+                "accepted": [
+                    {
+                        "finding_name": entry[0].finding_name,
+                        "suspect_function_id": entry[0].suspect_function_id,
+                        "suspect_line": entry[0].suspect_line,
+                    }
+                    for entry in accepted_chain
+                ],
+                "next_round_excluded": [
+                    {
+                        "finding_name": entry[0].finding_name,
+                        "suspect_function_id": entry[0].suspect_function_id,
+                        "suspect_line": entry[0].suspect_line,
+                    }
+                    for entry in accepted_chain
+                ],
+                "terminated_by": terminated_by,
             },
-            validator.status.value,
-        )
+            "per_finding_payloads": accepted_payloads,
+            "agentic_transcript": agentic_transcript_for_unit,
+        }
+
+        return accepted_chain, shared_state, checkpoint_status
+
+    @staticmethod
+    def _aggregate_checkpoint_status(statuses) -> str:
+        """Pick the most-significant checkpoint label across N findings.
+
+        Priority (highest first): Valid > Partial Valid > Inconclusive >
+        False Positive. Empty input → "no_finding".
+        """
+
+        priority = {
+            ValidationStatus.VALID: 0,
+            ValidationStatus.PARTIAL_VALID: 1,
+            ValidationStatus.INCONCLUSIVE: 2,
+            ValidationStatus.FALSE_POSITIVE: 3,
+        }
+        best: ValidationStatus | None = None
+        for status in statuses:
+            if best is None or priority.get(status, 99) < priority.get(best, 99):
+                best = status
+        return best.value if best is not None else "no_finding"
 
     def _process_unit_teaming(
         self,
@@ -934,8 +1461,32 @@ class AuditWorkflow:
             self._analyzer_record_to_dict(record) for record in analyzer_records
         ]
         analyzer_model_settings = self._teaming_model_settings(
-            self.config.teaming.analyzer, role="auditor", records=analyzer_records
+            role="auditor", records=analyzer_records
         )
+
+        # ``replication-cap reached`` warning: when every replica
+        # produced a distinct surviving candidate (i.e.
+        # ``len(consolidated) == len(analyzer_records)`` and that
+        # equals the configured replica count), there's no signal
+        # that the model converged on the unit's full finding set.
+        # The operator may want to raise ``audit.replication.analyzer``
+        # if completeness matters here. Counterpart of fast mode's
+        # ``max_findings_per_unit cap reached`` warning emitted from
+        # ``_process_unit_single``.
+        replica_count = len(analyzer_records)
+        if (
+            replica_count > 1
+            and len(consolidated) == replica_count
+            and self.logger is not None
+        ):
+            self.logger.warning(
+                f"replication-cap reached "
+                f"(path={unit.path.path_fingerprint}, "
+                f"replication.analyzer={replica_count}); "
+                "every analyzer replica produced a distinct surviving "
+                "candidate, so additional candidates may exist. Raise "
+                "audit.replication.analyzer if completeness matters here."
+            )
         if not consolidated:
             representative = analyzer_records[0].result if analyzer_records else AnalyzerResult(
                 status="no_issue"
@@ -997,7 +1548,7 @@ class AuditWorkflow:
                 self._validator_record_to_dict(record) for record in validator_records
             ]
             validator_model_settings[finding_fingerprint] = self._teaming_model_settings(
-                self.config.teaming.validator, role="validator", records=validator_records
+                role="validator", records=validator_records
             )
             if debate is not None:
                 validator_debates[finding_fingerprint] = self._debate_to_dict(debate)
@@ -1033,7 +1584,7 @@ class AuditWorkflow:
                 self._exploiter_record_to_dict(record) for record in exploiter_records
             ]
             exploiter_model_settings[finding_fingerprint] = self._teaming_model_settings(
-                self.config.teaming.exploiter, role="exploitation", records=exploiter_records
+                role="exploitation", records=exploiter_records
             )
 
             consolidated_analyzer_payloads.append(
@@ -1206,7 +1757,7 @@ class AuditWorkflow:
             function_ids=unit.function_ids,
         )
 
-    def _build_finding(self, *, index: int, unit, path_functions, analyzer, exploitation, validator, referenced_symbols=()):
+    def _build_finding(self, *, index: int, unit, path_functions, analyzer, exploitation, validator, referenced_symbols=(), agentic_transcript: tuple[dict[str, object], ...] = ()):
         if analyzer.status != "candidate":
             if self.logger is not None:
                 self.logger.debug_kv(
@@ -1256,6 +1807,7 @@ class AuditWorkflow:
             suspect_line=analyzer.suspect_line,
             context_notes=analyzer.context_notes,
             referenced_symbols=tuple(dict(symbol) for symbol in referenced_symbols),
+            agentic_transcript=agentic_transcript,
         )
 
     def _render_chain_snippets(

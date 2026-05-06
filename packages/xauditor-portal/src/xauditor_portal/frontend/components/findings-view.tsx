@@ -1,10 +1,16 @@
 "use client";
 
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import * as React from "react";
 import { useFindings } from "@/lib/api";
 import { EmptyState } from "@/components/ui/empty-state";
 import { FilterBar } from "@/components/filter-bar";
 import { FindingCard } from "@/components/finding-card";
+import {
+  VALIDATION_DEFAULT,
+  parseFiltersFromSearchParams,
+  serializeFiltersToQueryString,
+} from "@/lib/findings-filters";
 import type { FindingFilters } from "@/lib/types";
 
 export function FindingsView({
@@ -12,17 +18,42 @@ export function FindingsView({
   runMode,
   runStatus,
   banner,
-  initialFilters,
 }: {
   runId: string;
-  runMode?: "single" | "team";
+  runMode?: "fast" | "deep";
   runStatus?: "in_progress" | "completed" | "failed" | "cancelled";
   banner?: React.ReactNode;
-  initialFilters?: FindingFilters;
 }) {
-  const [filters, setFilters] = React.useState<FindingFilters>(
-    initialFilters ?? {},
-  );
+  const router = useRouter();
+  const pathname = usePathname();
+  const searchParams = useSearchParams();
+
+  // Initial filter state: parse the URL once. If no validation_status param
+  // is present (key absent entirely), apply the FP-excluding default and
+  // materialize it into the URL via replaceState so the page is reload-stable.
+  // If the URL already encodes validation_status (including the empty marker
+  // `?validation_status=`), honor it verbatim — see spec.
+  const [filters, setFilters] = React.useState<FindingFilters>(() => {
+    const parsed = parseFiltersFromSearchParams(searchParams);
+    if (!searchParams.has("validation_status")) {
+      return { ...parsed, validation_status: [...VALIDATION_DEFAULT] };
+    }
+    return parsed;
+  });
+
+  // Sync the chosen filter state back to the URL. The first effect run
+  // materializes the FP-excluding default via replaceState (no history
+  // entry) so reloads are stable; subsequent user-driven changes also use
+  // replaceState (we don't want a back-button entry for every checkbox
+  // toggle).
+  const lastSerializedRef = React.useRef<string | null>(null);
+  React.useEffect(() => {
+    const qs = serializeFiltersToQueryString(filters);
+    if (qs === lastSerializedRef.current) return;
+    lastSerializedRef.current = qs;
+    router.replace(qs ? `${pathname}?${qs}` : pathname, { scroll: false });
+  }, [filters, pathname, router]);
+
   const [expanded, setExpanded] = React.useState<Record<string, boolean>>({});
   const { data, isLoading, error } = useFindings(runId, filters, {
     pollWhileRunning: runStatus === "in_progress",

@@ -17,12 +17,13 @@ import {
 } from "@/components/ui/badge";
 import { FeedbackControl } from "@/components/feedback-control";
 import { FindingDebateSection } from "@/components/finding-debate-section";
+import { PerUnitVerdictsPanel } from "@/components/per-unit-verdicts";
 import type { FeedbackPayload, FindingSummary } from "@/lib/types";
 
 interface Props {
   finding: FindingSummary;
   runId: string;
-  runMode?: "single" | "team";
+  runMode?: "fast" | "deep";
   expanded: boolean;
   onToggle: (next: boolean) => void;
 }
@@ -104,7 +105,7 @@ export function FindingCard({
       ? `${finding.file_path}:${finding.suspect_line ?? "?"}`
       : finding.finding_id;
 
-  const showDebate = runMode === "team" && finding.has_debate;
+  const showDebate = runMode === "deep" && finding.has_debate;
   const sourceGroups = detail.data
     ? groupReferencesByFile(detail.data.source_references)
     : [];
@@ -275,6 +276,9 @@ export function FindingCard({
                 <p className="whitespace-pre-wrap leading-relaxed">
                   {detail.data.validation_analysis}
                 </p>
+                <PerUnitVerdictsPanel
+                  reconciliation={detail.data.reconciliation}
+                />
               </Section>
               {detail.data.referenced_symbols.length > 0 ? (
                 <Section title="Referenced symbols">

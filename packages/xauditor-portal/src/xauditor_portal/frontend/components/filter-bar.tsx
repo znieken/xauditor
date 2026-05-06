@@ -3,8 +3,36 @@
 import { RotateCcw } from "lucide-react";
 import * as React from "react";
 import { Button } from "@/components/ui/button";
-import { Input, Label, Select } from "@/components/ui/input";
-import type { FindingFilters, FeedbackLabel } from "@/lib/types";
+import { Input, Label } from "@/components/ui/input";
+import { MultiSelect } from "@/components/ui/multi-select";
+import { VALIDATION_DEFAULT } from "@/lib/findings-filters";
+import type { FeedbackLabel, FindingFilters } from "@/lib/types";
+
+const CONFIDENCE_OPTIONS = [
+  { value: "High", label: "High" },
+  { value: "Medium", label: "Medium" },
+  { value: "Low", label: "Low" },
+];
+
+const VALIDATION_OPTIONS = [
+  { value: "Valid", label: "Valid" },
+  { value: "Partial Valid", label: "Partial Valid" },
+  { value: "Inconclusive", label: "Inconclusive" },
+  { value: "False Positive", label: "False Positive" },
+];
+
+const EXPLOITATION_OPTIONS = [
+  { value: "exploitable", label: "Exploitable" },
+  { value: "uncertain", label: "Uncertain" },
+  { value: "not_exploitable", label: "Not exploitable" },
+];
+
+const FEEDBACK_OPTIONS: { value: FeedbackLabel; label: string }[] = [
+  { value: "true_positive", label: "True positive" },
+  { value: "false_positive", label: "False positive" },
+  { value: "duplicate", label: "Duplicate" },
+  { value: "unlabeled", label: "Unlabeled" },
+];
 
 export function FilterBar({
   value,
@@ -17,21 +45,44 @@ export function FilterBar({
   onExpandAll: () => void;
   onCollapseAll: () => void;
 }) {
-  function setField<K extends keyof FindingFilters>(
-    key: K,
-    v: FindingFilters[K] | "",
+  function setScalar(
+    key: "file" | "function" | "q",
+    v: string,
   ) {
     const next = { ...value };
-    if (v === "" || v === undefined) {
+    if (v === "") delete next[key];
+    else next[key] = v;
+    onChange(next);
+  }
+
+  function setArray(
+    key: "confidence" | "validation_status" | "exploitation_status",
+    v: string[],
+  ) {
+    const next = { ...value };
+    // For validation_status, an empty array is meaningful (the "user
+    // explicitly cleared it" marker the URL serializer encodes as
+    // `?validation_status=`). For the other two arrays, drop the key
+    // entirely on empty so the URL stays tidy.
+    if (key === "validation_status") {
+      next.validation_status = v;
+    } else if (v.length === 0) {
       delete next[key];
     } else {
-      next[key] = v as FindingFilters[K];
+      next[key] = v;
     }
     onChange(next);
   }
 
+  function setFeedback(v: FeedbackLabel[]) {
+    const next = { ...value };
+    if (v.length === 0) delete next.feedback_label;
+    else next.feedback_label = v;
+    onChange(next);
+  }
+
   function reset() {
-    onChange({});
+    onChange({ validation_status: [...VALIDATION_DEFAULT] });
   }
 
   return (
@@ -43,7 +94,7 @@ export function FilterBar({
             id="filter-file"
             placeholder="substring"
             value={value.file ?? ""}
-            onChange={(event) => setField("file", event.target.value)}
+            onChange={(event) => setScalar("file", event.target.value)}
           />
         </div>
         <div className="space-y-1">
@@ -52,68 +103,48 @@ export function FilterBar({
             id="filter-function"
             placeholder="substring"
             value={value.function ?? ""}
-            onChange={(event) => setField("function", event.target.value)}
+            onChange={(event) => setScalar("function", event.target.value)}
           />
         </div>
         <div className="space-y-1">
           <Label htmlFor="filter-confidence">Confidence</Label>
-          <Select
+          <MultiSelect
             id="filter-confidence"
-            value={value.confidence ?? ""}
-            onChange={(event) => setField("confidence", event.target.value)}
-          >
-            <option value="">Any</option>
-            <option value="High">High</option>
-            <option value="Medium">Medium</option>
-            <option value="Low">Low</option>
-          </Select>
+            label="Confidence"
+            options={CONFIDENCE_OPTIONS}
+            value={value.confidence ?? []}
+            onChange={(v) => setArray("confidence", v)}
+          />
         </div>
         <div className="space-y-1">
           <Label htmlFor="filter-validation">Validation</Label>
-          <Select
+          <MultiSelect
             id="filter-validation"
-            value={value.validation_status ?? ""}
-            onChange={(event) =>
-              setField("validation_status", event.target.value)
-            }
-          >
-            <option value="">Any</option>
-            <option value="Valid">Valid</option>
-            <option value="Partial Valid">Partial Valid</option>
-            <option value="Inconclusive">Inconclusive</option>
-            <option value="False Positive">False Positive</option>
-          </Select>
+            label="Validation"
+            options={VALIDATION_OPTIONS}
+            value={value.validation_status ?? []}
+            onChange={(v) => setArray("validation_status", v)}
+          />
         </div>
         <div className="space-y-1">
           <Label htmlFor="filter-exploitation">Exploitation</Label>
-          <Select
+          <MultiSelect
             id="filter-exploitation"
-            value={value.exploitation_status ?? ""}
-            onChange={(event) =>
-              setField("exploitation_status", event.target.value)
-            }
-          >
-            <option value="">Any</option>
-            <option value="exploitable">Exploitable</option>
-            <option value="uncertain">Uncertain</option>
-            <option value="not_exploitable">Not exploitable</option>
-          </Select>
+            label="Exploitation"
+            options={EXPLOITATION_OPTIONS}
+            value={value.exploitation_status ?? []}
+            onChange={(v) => setArray("exploitation_status", v)}
+          />
         </div>
         <div className="space-y-1">
           <Label htmlFor="filter-feedback">Feedback</Label>
-          <Select
+          <MultiSelect
             id="filter-feedback"
-            value={value.feedback_label ?? ""}
-            onChange={(event) =>
-              setField("feedback_label", event.target.value as FeedbackLabel)
-            }
-          >
-            <option value="">Any</option>
-            <option value="true_positive">True positive</option>
-            <option value="false_positive">False positive</option>
-            <option value="duplicate">Duplicate</option>
-            <option value="unlabeled">Unlabeled</option>
-          </Select>
+            label="Feedback"
+            options={FEEDBACK_OPTIONS}
+            value={value.feedback_label ?? []}
+            onChange={(v) => setFeedback(v as FeedbackLabel[])}
+          />
         </div>
       </div>
       <div className="flex flex-wrap items-end gap-3 md:items-center md:justify-between">
@@ -123,7 +154,7 @@ export function FilterBar({
             id="filter-q"
             placeholder="free-text over name / description / analysis / reason"
             value={value.q ?? ""}
-            onChange={(event) => setField("q", event.target.value)}
+            onChange={(event) => setScalar("q", event.target.value)}
           />
         </div>
         <div className="flex items-center gap-2">

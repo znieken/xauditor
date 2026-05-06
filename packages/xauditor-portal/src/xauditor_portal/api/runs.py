@@ -6,7 +6,7 @@ import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from pydantic import BaseModel, Field
@@ -43,9 +43,9 @@ class RunSummary(BaseModel):
     project_name: str
     build_fingerprint: str
     mode: str
+    stages_form: Literal["prompt", "agentic"] = "prompt"
     status: str
     progress_percent: int
-    total_candidates: int
     valid_findings: int
     false_positives: int
     unlabeled_findings: int
@@ -66,8 +66,17 @@ class RunDetail(RunSummary):
     report_dir: str | None
     llm_providers_used: dict[str, Any]
     valid_findings_breakdown: FeedbackBreakdown
-    false_positives_breakdown: FeedbackBreakdown
     valid_rate: float | None = None
+    coverage_gaps: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Per-run CoverageGaps payload. Schema: "
+            "`{audited_classes: list[str], skipped_by_mode: list[str], "
+            "out_of_scope: list[str], mode: 'fast'|'deep', advice_to_user: str}`. "
+            "NULL on runs created before `restructure-audit-modes-and-coverage` "
+            "Phase 5A populated the column."
+        ),
+    )
 
 
 _VALID_STATUSES = ("Valid", "Partial Valid", "Inconclusive")
@@ -82,10 +91,11 @@ _LABEL_FALSE_POSITIVE = "false_positive"
 class _RunMetrics:
     """Per-run live counts derived from a single SQL pivot.
 
-    The four scalar counts are authoritative; the breakdowns expose the
-    same numbers in component form for the run-detail card UI. ``valid_rate``
-    is only consumed by ``RunDetail`` but computed unconditionally because
-    it costs nothing once the counts are in hand.
+    ``false_positives`` counts findings whose latest feedback annotation has
+    ``label = 'false_positive'`` (independent of agent ``validation_status``).
+    ``valid_findings`` retains its agent-base + human-feedback adjustment
+    shape; the matching ``valid_breakdown`` exposes the components for the
+    run-detail card UI.
     """
 
     valid_findings: int
@@ -93,7 +103,6 @@ class _RunMetrics:
     duplicate_findings: int
     unlabeled_findings: int
     valid_breakdown: FeedbackBreakdown
-    fp_breakdown: FeedbackBreakdown
     valid_rate: float | None
 
 
@@ -111,7 +120,6 @@ def _zero_metrics() -> _RunMetrics:
         duplicate_findings=0,
         unlabeled_findings=0,
         valid_breakdown=zero,
-        fp_breakdown=zero,
         valid_rate=None,
     )
 
@@ -120,7 +128,6 @@ def _build_metrics_select(*group_columns):
     """Shared SELECT pivot used by both the per-run and batched helpers."""
 
     is_valid = Finding.validation_status.in_(_VALID_STATUSES)
-    is_fp = Finding.validation_status == _FP_STATUS
     label = FindingAnnotation.label
     no_annotation = FindingAnnotation.id.is_(None)
     is_duplicate = label == _LABEL_DUPLICATE
@@ -133,17 +140,14 @@ def _build_metrics_select(*group_columns):
             *group_columns,
             func.count().label("total_count"),
             func.count().filter(is_valid).label("base_valid"),
-            func.count().filter(is_fp).label("base_fp"),
-            func.count().filter(is_fp & is_human_tp).label("valid_added"),
+            func.count().filter(is_human_fp).label("false_positives_count"),
+            func.count()
+            .filter(Finding.validation_status == _FP_STATUS, is_human_tp)
+            .label("valid_added"),
             func.count().filter(is_valid & is_human_fp).label("valid_removed"),
-            func.count().filter(is_valid & is_human_fp).label("fp_added"),
-            func.count().filter(is_fp & is_human_tp).label("fp_removed"),
             func.count()
             .filter(is_valid & is_duplicate)
             .label("duplicates_among_valid"),
-            func.count()
-            .filter(is_fp & is_duplicate)
-            .label("duplicates_among_fp"),
             func.count().filter(is_duplicate).label("duplicates_total"),
             func.count()
             .filter(no_annotation | is_unlabeled)
@@ -158,19 +162,14 @@ def _build_metrics_select(*group_columns):
 
 def _row_to_metrics(row) -> _RunMetrics:
     base_valid = int(row.base_valid or 0)
-    base_fp = int(row.base_fp or 0)
     valid_added = int(row.valid_added or 0)
     valid_removed = int(row.valid_removed or 0)
-    fp_added = int(row.fp_added or 0)
-    fp_removed = int(row.fp_removed or 0)
     duplicates_among_valid = int(row.duplicates_among_valid or 0)
-    duplicates_among_fp = int(row.duplicates_among_fp or 0)
     duplicates_total = int(row.duplicates_total or 0)
     unlabeled_count = int(row.unlabeled_count or 0)
-    total_count = int(row.total_count or 0)
+    false_positives = int(row.false_positives_count or 0)
 
     valid_net = base_valid + valid_added - valid_removed - duplicates_among_valid
-    fp_net = base_fp + fp_added - fp_removed - duplicates_among_fp
 
     valid_breakdown = FeedbackBreakdown(
         base=base_valid,
@@ -179,24 +178,25 @@ def _row_to_metrics(row) -> _RunMetrics:
         duplicates_in_bucket=duplicates_among_valid,
         net=valid_net,
     )
-    fp_breakdown = FeedbackBreakdown(
-        base=base_fp,
-        added_by_feedback=fp_added,
-        removed_by_feedback=fp_removed,
-        duplicates_in_bucket=duplicates_among_fp,
-        net=fp_net,
-    )
 
-    denom = total_count - duplicates_total
-    valid_rate = valid_net / denom if denom > 0 else None
+    # `portal-drop-candidates-and-rebase-positive-rate`: re-base the
+    # rate to mean "agent precision after reviewer feedback".
+    # Denominator is `base_valid` (count of findings the agent put
+    # into its valid-side pool: validation_status in
+    # _VALID_STATUSES) rather than the previous
+    # `total_count - duplicates_total`. The new value answers: of
+    # the findings the agent claimed as valid, how many held up
+    # after feedback. Range allows >1.0 when the reviewer promotes
+    # more FP-bucket findings to true_positive than they downgrade
+    # Valid to false_positive.
+    valid_rate = valid_net / base_valid if base_valid > 0 else None
 
     return _RunMetrics(
         valid_findings=valid_net,
-        false_positives=fp_net,
+        false_positives=false_positives,
         duplicate_findings=duplicates_total,
         unlabeled_findings=unlabeled_count,
         valid_breakdown=valid_breakdown,
-        fp_breakdown=fp_breakdown,
         valid_rate=valid_rate,
     )
 
@@ -205,9 +205,9 @@ async def _run_metrics(session: AsyncSession, run_id: str) -> _RunMetrics:
     """Compute every live count for one run in a single SQL round-trip.
 
     LEFT-JOINs ``feedback.finding_annotations`` against ``report.findings``
-    and pivots the six existing counts plus four new ones
-    (``duplicates_among_valid``, ``duplicates_among_fp``, ``duplicates_total``,
-    ``unlabeled_count``) and the bare ``total_count``. The
+    and pivots the valid-side base + adjustment counts, the feedback-derived
+    ``false_positives_count`` (annotations whose label is ``false_positive``),
+    and the duplicate / unlabeled / total counts. The
     ``feedback.finding_annotations`` UNIQUE on (run_id, finding_id) keeps the
     join row-equivalent to a per-finding lookup, so no de-duplication is
     needed in the COUNT FILTERs. Cost scales with findings-per-run; uses the
@@ -246,19 +246,6 @@ async def _batch_run_metrics(
     return {str(row.run_id): _row_to_metrics(row) for row in rows}
 
 
-async def _feedback_breakdowns(
-    session: AsyncSession, run_id: str
-) -> tuple[FeedbackBreakdown, FeedbackBreakdown]:
-    """Backwards-compatible thin wrapper around :func:`_run_metrics`.
-
-    Kept so existing callers (and tests) keep working while the API
-    transitions to reading metrics via ``_run_metrics`` directly.
-    """
-
-    metrics = await _run_metrics(session, run_id)
-    return metrics.valid_breakdown, metrics.fp_breakdown
-
-
 class ProgressEventOut(BaseModel):
     stage: str
     heartbeat_kind: str
@@ -280,9 +267,9 @@ def _to_summary(row: AuditRun, metrics: _RunMetrics) -> RunSummary:
         project_name=row.project_name,
         build_fingerprint=row.build_fingerprint,
         mode=row.mode,
+        stages_form=row.stages_form,
         status=row.status,
         progress_percent=row.progress_percent,
-        total_candidates=row.total_candidates,
         valid_findings=metrics.valid_findings,
         false_positives=metrics.false_positives,
         unlabeled_findings=metrics.unlabeled_findings,
@@ -350,8 +337,8 @@ async def _build_run_detail(
         report_dir=row.report_dir,
         llm_providers_used=row.llm_providers_used,
         valid_findings_breakdown=metrics.valid_breakdown,
-        false_positives_breakdown=metrics.fp_breakdown,
         valid_rate=metrics.valid_rate,
+        coverage_gaps=row.coverage_gaps,
     )
 
 
@@ -842,7 +829,9 @@ async def run_finding_debate(
     """Return the validator debate for a single finding within a run.
 
     Returns 404 when the run or finding does not exist, or when the finding
-    has no associated debate (single-mode runs never have debates).
+    has no associated debate (fast-mode runs never have debates;
+    deep-mode runs only emit a debate when validator replicas
+    disagreed).
     """
 
     from xauditor_portal.db.models.report import Finding  # local import to avoid cycle

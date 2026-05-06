@@ -10,8 +10,18 @@ The set of keys editable from the portal UI is intentionally narrow:
 - `graph.build.*` (enable_llm_enrichment, max_file_bytes, paths_max_depth,
   paths_max_count, neo4j_chunk_size)
 - `audit.worker_count`
-- `teaming.enabled`, `teaming.analyzer.*`, `teaming.validator.*`,
-  `teaming.exploiter.*`
+- `audit.mode`, `audit.replication.{analyzer,validator,exploiter}`,
+  `audit.validator.debate.{enabled,max_rounds,halt_on_consensus}`,
+  `audit.{analyzer,validator,exploiter}.provider_list`,
+  `audit.max_findings_per_unit`
+- Legacy `teaming.enabled`, `teaming.analyzer.*`,
+  `teaming.validator.*`, `teaming.exploiter.*` — still
+  allow-listed for one minor release for backward compatibility;
+  the ``_migrate_legacy_teaming`` shim in ``xauditor.config``
+  translates them to the canonical ``audit.*`` shape on read,
+  including ``teaming.<stage>.provider_list`` →
+  ``audit.<stage>.provider_list`` (Phase 1B,
+  ``migrate-provider-list-to-audit-namespace``)
 - `coder.*` operational + infrastructure knobs (deprecated
   `coder.repo_mount_path` not exposed)
 - `llm.default_provider`, `llm.providers.<name>.{base_url,model_name,

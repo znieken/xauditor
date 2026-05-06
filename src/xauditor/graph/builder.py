@@ -16,6 +16,7 @@ from xauditor.graph.canonical import (
     DiscoveredFunction,
     DiscoveredGraph,
     DiscoveredModuleSymbol,
+    DiscoveredRegistration,
     DiscoveredSymbolUse,
 )
 from xauditor.graph.fingerprint import compute_build_fingerprint
@@ -264,6 +265,7 @@ class GraphSynthesizerAgent:
             provenance: list[GraphProvenance] = []
             module_symbols: list[DiscoveredModuleSymbol] = []
             symbol_uses: list[DiscoveredSymbolUse] = []
+            registrations: list[DiscoveredRegistration] = []
             lsp_state: dict[str, object] = {"hover": {}, "diagnostics": {}}
 
             for file in files:
@@ -301,6 +303,21 @@ class GraphSynthesizerAgent:
                             type_annotation=symbol.type_annotation,
                             value_repr=symbol.value_repr,
                             is_placeholder=symbol.is_placeholder,
+                        )
+                    )
+                # `capture-decorators-and-registrations` Phase 1.3 —
+                # collect parsed registration call sites; canonical.py
+                # resolves `callable_name` to function_id during
+                # finalize.
+                for parsed_reg in getattr(parsed, "registrations", ()):
+                    registrations.append(
+                        DiscoveredRegistration(
+                            file_path=file.path,
+                            framework=parsed_reg.framework,
+                            intent=parsed_reg.intent,
+                            line_number=parsed_reg.line,
+                            callable_name=parsed_reg.callable_name,
+                            expression=parsed_reg.expression,
                         )
                     )
                 symbol_id_by_name = {
@@ -419,6 +436,7 @@ class GraphSynthesizerAgent:
                             module_name=file.module_name,
                             start_line=function.start_line,
                             end_line=function.end_line,
+                            decorators=function.decorators,
                             summary=(
                                 self.llm_client.summarize_function(
                                     function.qualified_name, file.path, function_source
@@ -441,6 +459,7 @@ class GraphSynthesizerAgent:
                             if self.enable_enrichment
                             else "",
                             class_id=function.class_id,
+                            mutates_self=function.mutates_self,
                         )
                     )
                     provenance.append(
@@ -461,6 +480,7 @@ class GraphSynthesizerAgent:
                 agent_state={"graph_synthesizer": lsp_state},
                 module_symbols=tuple(module_symbols),
                 symbol_uses=tuple(symbol_uses),
+                registrations=tuple(registrations),
             )
 
         discovered, meta = invoke_agent(
@@ -690,6 +710,7 @@ class LangChainGraphBuilder:
                 },
                 module_symbols=discovered.module_symbols,
                 symbol_uses=discovered.symbol_uses,
+                registrations=discovered.registrations,
             )
             if state_store is not None:
                 state_store.save_synthesized_stage(fingerprint, discovered)

@@ -3,6 +3,153 @@
 This file tracks the version of the `xauditor-portal` package specifically.
 Main-package changes (`xauditor`) live in `../../CHANGELOG.md`.
 
+## [Unreleased]
+
+### Added
+
+- **`stages_form` per-run column + portal chip.** New alembic 0014
+  adds `report.audit_runs.stages_form TEXT NOT NULL DEFAULT 'prompt'`
+  with a CHECK accepting `'prompt' | 'agentic'`. Pre-existing rows
+  backfill to `'prompt'`. The Postgres sink writes the value at
+  run-open time from `RunMeta.stages_form` (threaded from
+  `audit.stages.form`). `RunSummary` / `RunDetail` API responses
+  carry the field as a `Literal["prompt", "agentic"]`. The portal
+  run-detail header renders a `Stages: <value>` chip alongside
+  `ModeChip` / `StatusChip`, and the per-build runs table renders a
+  compact form indicator next to the mode chip on every row.
+  (`portal-show-stages-form`)
+
+### Changed
+
+- **BREAKING (UI/API):** `total_candidates` is removed from the run-summary
+  API surface and the portal UI. The DB column
+  `report.audit_runs.total_candidates` stays (still written by the audit
+  pipeline; useful for direct DB queries). The "Total candidates" tile on
+  the run detail page and the matching column on the per-build runs table
+  are deleted. Operators who need the raw analyzer-path count SHALL query
+  the DB directly. (`portal-drop-candidates-and-rebase-positive-rate`)
+- **BREAKING (API semantic):** `valid_rate` (rendered as "Positive rate"
+  on the portal) is re-based to mean **agent precision after reviewer
+  feedback**: `valid_rate = valid_net / base_valid` (denominator is the
+  count of findings the agent put into its valid-side pool —
+  `validation_status ∈ {Valid, Partial Valid, Inconclusive}`). The
+  previous formula divided by `total_findings - duplicates_total`, which
+  diluted high-precision agent runs with True-Negative `False Positive`
+  rows. New range allows `> 1.0` (rendered honestly as e.g. `180.0%`)
+  when the reviewer promotes more FP findings to true_positive than they
+  downgrade Valid to false_positive. The portal tile label changes from
+  "Valid rate" to "Positive rate" with a tooltip explaining the
+  agent-precision semantic. (`portal-drop-candidates-and-rebase-positive-rate`)
+- **BREAKING (UI/API):** `false_positives` on every run, build, and project
+  surface is now derived from human feedback (count of findings whose latest
+  annotation has `label = 'false_positive'`). The agent's
+  `validation_status = 'False Positive'` no longer contributes. Runs with no
+  feedback annotations therefore show `false_positives = 0` even when the
+  agent flagged some findings as FP.
+- **BREAKING (API):** `RunDetail` no longer carries `false_positives_breakdown`.
+  The valid-side `valid_findings_breakdown` block is unchanged (it retains its
+  `base / added_by_feedback / removed_by_feedback / duplicates_in_bucket / net`
+  shape).
+- The findings filter API (`GET /api/runs/{id}/findings`) now accepts
+  array-valued query parameters for `confidence`, `validation_status`,
+  `exploitation_status`, and `feedback_label`. Each non-empty list applies as
+  `column IN (...)`. Single-value bookmarks (`?validation_status=Valid`) keep
+  working — FastAPI parses one occurrence into a one-element list.
+- The run findings filter bar's four enum controls (Confidence, Validation,
+  Exploitation, Feedback) are now multi-select popovers. The Validation filter
+  defaults to `[Valid, Partial Valid, Inconclusive]` (False Positive unchecked)
+  on first render of a run with no `validation_status` query param; the
+  default is materialized into the URL via `replaceState` so the page is
+  shareable and reload-stable. An explicit `?validation_status=` empty marker
+  in the URL suppresses the default.
+
+## [1.1.0] — 2026-05-04
+
+Coordinated 1.1.0 portal release covering the audit-restructure
+follow-on changes from `restructure-audit-modes-and-coverage`,
+`agentic-stage-runner-real`, and `portal-coverage-panel`.
+
+### Added
+
+- **Coverage panel on the run-detail page.** New
+  `frontend/components/coverage-panel.tsx` renders directly
+  above the findings list on every run-detail page, mirroring
+  the per-mode `coverage_gaps` JSONB payload (alembic 0011).
+  Three groups — `audited` / `skipped_by_mode` / `out_of_scope`
+  — render with success / warning / neutral tones. Fast-mode
+  runs with non-empty `skipped_by_mode` show a CTA banner with
+  a copy-to-clipboard button for the
+  `xauditor audit run --mode deep` command, dismissable per
+  run via a `coverage-cta-dismissed-{runId}` localStorage key.
+  Pre-Phase-5 runs (NULL `coverage_gaps`) render a
+  `n/a — pre-Phase-5 audit` placeholder.
+- **Per-Unit Verdicts panel on finding cards.** New
+  `frontend/components/per-unit-verdicts.tsx` renders inside
+  the expanded finding-card body, directly under the
+  Validation Analysis lines, whenever the finding's
+  `reconciliation` JSONB (alembic 0012) is non-null. Each row
+  renders the unit-kind badge + color-coded verdict +
+  click-to-expand truncated analysis; the
+  `consolidation_reasoning` block renders below the per-unit
+  list when populated. Returns `null` for path-only findings
+  so collapsed cards stay shape-stable. Lights up once the
+  agentic reconciler from `agentic-stage-runner-real` runs
+  against multi-unit-finding fixtures.
+- **`coverage_gaps` field on `RunDetail` API response.**
+  `GET /api/runs/{id}` now includes a `coverage_gaps:
+  CoverageGaps | null` field projected from the
+  `audit_runs.coverage_gaps` JSONB column. Always present in
+  the response (never omitted) — pre-Phase-5 runs surface as
+  `coverage_gaps: null`.
+- **`reconciliation` and `agentic_transcript` fields on
+  `FindingDetail` API response.** `GET /api/findings/{id}` now
+  includes `reconciliation: Reconciliation | null` (from
+  alembic 0012) and `agentic_transcript:
+  AgenticTranscriptEntry[] | null` (from alembic 0013)
+  projections. Always present, NULL on path-only / prompt-mode
+  findings.
+- **Settings: `audit.coverage_gaps.report` toggle.** New
+  Boolean Select control under **Audit mode → Advanced
+  overrides**. Default reads from the current effective
+  config; setting `false` suppresses the Coverage Gaps
+  payload + portal panel on subsequent audit runs.
+- **Alembic 0013 — `findings.agentic_transcript`.** New JSONB
+  column persisting the agentic stage runner's per-finding
+  conversation log when the run uses
+  `audit.stages.form: agentic`. NULL for prompt-mode findings.
+- **Alembic 0011 — audit-mode rename + `coverage_gaps`.**
+  `audit_runs.mode` constraint widened to
+  `{fast, deep, single, team}` (the legacy literals stay
+  accepted for one minor release per the migration shim);
+  added `audit_runs.coverage_gaps` JSONB column.
+- **Alembic 0012 — `findings.reconciliation`.** New JSONB
+  column on the `findings` table for the per-finding
+  `{per_unit_verdicts, consolidated_verdict,
+  consolidation_reasoning}` payload emitted by the cross-unit
+  reconciler stage.
+
+### Changed
+
+- **Settings page — "Teaming" section renamed to "Audit
+  mode".** The legacy `TeamingSection` component is now
+  `AuditModeSection` (`frontend/components/audit-mode-section.tsx`).
+  The card surfaces the canonical `audit.*` controls (mode
+  preset + replication + debate + per-unit cap +
+  coverage-gaps toggle) and keeps the legacy
+  `teaming.<stage>.provider_list` chip controls under
+  "Advanced overrides → Provider rotation (legacy)" until the
+  workflow's provider-rotation rewrite lands.
+
+### Migration
+
+Pre-existing portal databases roll forward via
+`xauditor-portal migrate` (or the auto-migration on backend
+container start, which has been the default since
+`xauditor-portal 0.2.3`). The three new alembic revisions are
+ordered 0011 → 0012 → 0013 and add only nullable columns +
+relax an existing CHECK constraint, so they apply
+non-destructively to live databases.
+
 ## [1.0.0] — 2026-05-02
 
 Coordinated 1.0.0 release with `xauditor` and `xauditor-coder-service`.

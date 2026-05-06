@@ -7,6 +7,19 @@ from pathlib import Path
 from typing import Iterable, Iterator, Sequence
 
 from xauditor.config import XAuditorConfig
+from xauditor.graph.framework_heuristics import classify_decorator
+from xauditor.graph.sink_labelling import label_sinks, resolve_sink_set
+
+# `_ParsedDecorator` is imported lazily inside `_build_decorator_records`
+# to avoid a circular import with `parsers.py` (which imports
+# `DiscoveredFile` from this module). Type annotations on
+# `DiscoveredFunction.decorators` reference the name as a string
+# under `from __future__ import annotations` so the runtime
+# import isn't needed at module load.
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from xauditor.graph.parsers import _ParsedDecorator
 from xauditor.llm import LLMClient
 from xauditor.models import (
     ClassMemberRecord,
@@ -15,15 +28,19 @@ from xauditor.models import (
     CoverageInventory,
     CoverageRecord,
     CoverageState,
+    DecoratorRecord,
     EdgeRecord,
     EnrichmentRecord,
     FileRecord,
+    FunctionDecoratorEdge,
     FunctionRecord,
+    FunctionRegistrationEdge,
     FunctionSymbolUseEdge,
     GraphProvenance,
     ModuleRecord,
     ModuleSymbolRecord,
     PathRecord,
+    RegistrationSiteRecord,
     RepositoryScope,
 )
 
@@ -71,6 +88,20 @@ class DiscoveredFunction:
     business_context: str = ""
     trust_boundary: str = ""
     class_id: str | None = None
+    # `capture-decorators-and-registrations` Phase 1.2 — raw
+    # decorator records from the language parser. canonical.py
+    # walks these per-function during finalize and emits one
+    # `DecoratorRecord` graph node + one `FunctionDecoratorEdge`
+    # per decorator. Languages without decorator-equivalent
+    # syntax (Go / C / C++ / Lua / Rust / Swift) emit empty
+    # tuples — no upstream branches needed.
+    decorators: tuple[_ParsedDecorator, ...] = ()
+    # `capture-decorators-and-registrations` Commit F. Set by the
+    # parser when the function body assigns to `self.<attr>` —
+    # used downstream by the planner to enumerate StateAuditUnits.
+    # Default False keeps non-method functions and non-Python
+    # parser output inert.
+    mutates_self: bool = False
 
 
 @dataclass(frozen=True)
@@ -109,6 +140,26 @@ class DiscoveredSymbolUse:
 
 
 @dataclass(frozen=True)
+class DiscoveredRegistration:
+    """One framework registration call site —
+    `capture-decorators-and-registrations` Phase 1.3.
+
+    The walker populates this from `_ParsedRegistration`; the
+    canonical finalize step resolves `callable_name` against
+    the per-file function table to produce the
+    `RegistrationSiteRecord` graph node + the
+    `FunctionRegistrationEdge` edge to the registered function.
+    """
+
+    file_path: str
+    framework: str
+    intent: str
+    line_number: int
+    callable_name: str  # un-resolved function reference
+    expression: str
+
+
+@dataclass(frozen=True)
 class DiscoveredGraph:
     files: tuple[DiscoveredFile, ...]
     classes: tuple[DiscoveredClass, ...]
@@ -120,6 +171,7 @@ class DiscoveredGraph:
     agent_state: dict[str, dict[str, object]] = field(default_factory=dict)
     module_symbols: tuple[DiscoveredModuleSymbol, ...] = ()
     symbol_uses: tuple[DiscoveredSymbolUse, ...] = ()
+    registrations: tuple[DiscoveredRegistration, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -227,7 +279,19 @@ class CanonicalGraphTransformer:
             for item in discovered.class_members
         )
 
-        function_records = tuple(
+        # `capture-decorators-and-registrations` Commit 2 — resolve
+        # the operator-tunable sink table once per build. Sink
+        # labelling sets `is_well_known_sink=true` + `sink_kind` on
+        # parsed Function nodes whose `qualified_name` matches; sink
+        # stub synthesis (below) creates Function nodes for external
+        # sinks called from the audit target so SinkAuditUnit
+        # enumeration can anchor on them.
+        sink_set = resolve_sink_set(
+            well_known=self.config.audit.sinks.well_known,
+            custom=self.config.audit.sinks.custom,
+        )
+
+        parsed_records = tuple(
             FunctionRecord(
                 function_id=function.function_id,
                 name=function.name,
@@ -241,9 +305,37 @@ class CanonicalGraphTransformer:
                 business_context=function.business_context if enrichment_enabled else "",
                 trust_boundary=function.trust_boundary if enrichment_enabled else "",
                 class_id=function.class_id,
+                # parsed records are NOT external; sink labels added below.
+                is_external=False,
+                mutates_self=function.mutates_self,
             )
             for function in discovered.functions
         )
+
+        # Apply sink labels to parsed records (rare — most stdlib
+        # sinks aren't redefined in user code, but operators may
+        # have a `myapp.run_shell` etc. in their `audit.sinks.custom`
+        # that matches a parsed function).
+        parsed_labels = label_sinks(parsed_records, sink_set)
+        if parsed_labels:
+            parsed_records = tuple(
+                _with_sink_label(record, parsed_labels.get(record.function_id))
+                for record in parsed_records
+            )
+
+        # Synthesize stub FunctionRecords for external sinks called
+        # from the audit target. The graph builder normally drops
+        # unresolved calls (line ~346: `if callee is None: continue`);
+        # for sink targets, we instead create a synthetic Function
+        # node so the resolver finds it + the edge lands.
+        parsed_qualified_names = {fn.qualified_name for fn in parsed_records}
+        stub_records = _synthesize_sink_stubs(
+            calls=discovered.calls,
+            parsed_qualified_names=parsed_qualified_names,
+            sink_set=sink_set,
+        )
+
+        function_records = parsed_records + stub_records
         for fn in function_records:
             modules_paths[fn.module_name].add(fn.file_path)
 
@@ -278,6 +370,61 @@ class CanonicalGraphTransformer:
         )
         self._chunked_write(
             self.repository.write_function_chunk, build_fingerprint, function_records, chunk_size
+        )
+
+        # `capture-decorators-and-registrations` Phase 1.5 —
+        # build DecoratorRecord + FunctionDecoratorEdge from each
+        # discovered function's `decorators` tuple. Skip stub
+        # function records (`is_external=True`) since they have no
+        # parsed source + no decorators. Languages without
+        # decorator-equivalent syntactic forms (Go / C / C++ /
+        # Lua / Rust / Swift) emit empty `decorators` tuples
+        # upstream so this loop just no-ops on their functions.
+        decorator_records, decorator_edges = _build_decorator_records(
+            discovered.functions
+        )
+        self._chunked_write(
+            getattr(self.repository, "write_decorator_chunk", _noop_write),
+            build_fingerprint,
+            decorator_records,
+            chunk_size,
+        )
+        self._chunked_write(
+            getattr(
+                self.repository,
+                "write_function_decorator_edge_chunk",
+                _noop_write,
+            ),
+            build_fingerprint,
+            decorator_edges,
+            chunk_size,
+        )
+
+        # `capture-decorators-and-registrations` Phase 1.3 / Commit C —
+        # resolve each registration call site against the parsed
+        # function table; emit RegistrationSiteRecord + REGISTERS
+        # edges. Stub function records (`is_external=True`) are
+        # excluded from the candidate pool so we never register a
+        # framework site against an external sink.
+        registration_records, registration_edges = _build_registration_records(
+            registrations=discovered.registrations,
+            function_records=function_records,
+        )
+        self._chunked_write(
+            getattr(self.repository, "write_registration_chunk", _noop_write),
+            build_fingerprint,
+            registration_records,
+            chunk_size,
+        )
+        self._chunked_write(
+            getattr(
+                self.repository,
+                "write_function_registration_edge_chunk",
+                _noop_write,
+            ),
+            build_fingerprint,
+            registration_edges,
+            chunk_size,
         )
 
         # Build function lookup dicts now that all functions are
@@ -645,3 +792,224 @@ def _noop_write(build_fingerprint, records) -> None:
     label so ``write_module_chunk`` is a no-op there)."""
 
     del build_fingerprint, records
+
+
+def _build_registration_records(
+    *,
+    registrations: Iterable[DiscoveredRegistration],
+    function_records: Iterable[FunctionRecord],
+) -> tuple[tuple[RegistrationSiteRecord, ...], tuple[FunctionRegistrationEdge, ...]]:
+    """Resolve each `DiscoveredRegistration` against the parsed
+    function table; emit one `RegistrationSiteRecord` graph node
+    + one `FunctionRegistrationEdge` per resolved (site, function)
+    pair.
+
+    Resolution rule: match `callable_name` against
+    `FunctionRecord.name` (the bare function name, not the
+    qualified name). For ambiguous matches (multiple functions
+    with the same bare name across files), prefer the function
+    in the SAME file as the registration site; fall back to the
+    first match if no same-file candidate exists.
+
+    Registrations whose `callable_name` doesn't resolve to any
+    parsed function are dropped — pointing at nothing useful.
+    """
+
+    fns_by_name: dict[str, list[FunctionRecord]] = defaultdict(list)
+    for fn in function_records:
+        if not fn.is_external:
+            fns_by_name[fn.name].append(fn)
+
+    sites: list[RegistrationSiteRecord] = []
+    edges: list[FunctionRegistrationEdge] = []
+    seen_site_ids: set[str] = set()
+    for reg in registrations:
+        candidates = fns_by_name.get(reg.callable_name, [])
+        if not candidates:
+            continue
+        # Prefer same-file match; else first.
+        target = next(
+            (fn for fn in candidates if fn.file_path == reg.file_path),
+            candidates[0],
+        )
+        site_id = _registration_merge_key(
+            file_path=reg.file_path,
+            line_number=reg.line_number,
+            expression=reg.expression,
+        )
+        edges.append(
+            FunctionRegistrationEdge(
+                registration_id=site_id,
+                function_id=target.function_id,
+            )
+        )
+        if site_id in seen_site_ids:
+            continue
+        seen_site_ids.add(site_id)
+        sites.append(
+            RegistrationSiteRecord(
+                registration_id=site_id,
+                framework=reg.framework,
+                intent=reg.intent,
+                expression=reg.expression,
+                file_path=reg.file_path,
+                line_number=reg.line_number,
+            )
+        )
+    return tuple(sites), tuple(edges)
+
+
+def _registration_merge_key(
+    *, file_path: str, line_number: int, expression: str
+) -> str:
+    """Deterministic, compact id derived from the MERGE key tuple."""
+
+    raw = f"{file_path}:{line_number}:{expression}"
+    return f"reg::{hashlib.sha1(raw.encode('utf-8')).hexdigest()[:16]}"
+
+
+def _build_decorator_records(
+    functions: Iterable[DiscoveredFunction],
+) -> tuple[tuple[DecoratorRecord, ...], tuple[FunctionDecoratorEdge, ...]]:
+    """Walk each function's parsed decorators and emit one
+    `DecoratorRecord` graph node + one `FunctionDecoratorEdge`
+    per (function, position) pair.
+
+    Decorator MERGE key is `(file_path, line_number, expression)`
+    so two decorators at the same source location with the same
+    expression are by definition the same node — re-graph-build
+    is idempotent. The `decorator_id` is a deterministic short
+    hash of that tuple to keep keys compact.
+
+    `framework` and `intent` come from `framework_heuristics.classify_decorator(
+    expression)`; both empty strings when the expression doesn't
+    match any pattern.
+    """
+
+    decorators: list[DecoratorRecord] = []
+    edges: list[FunctionDecoratorEdge] = []
+    seen_decorator_ids: set[str] = set()
+    for fn in functions:
+        if not fn.decorators:
+            continue
+        for parsed in fn.decorators:
+            decorator_id = _decorator_merge_key(
+                file_path=fn.file_path,
+                line_number=parsed.line,
+                expression=parsed.expression,
+            )
+            edges.append(
+                FunctionDecoratorEdge(
+                    function_id=fn.function_id,
+                    decorator_id=decorator_id,
+                    position=parsed.position,
+                )
+            )
+            if decorator_id in seen_decorator_ids:
+                continue
+            seen_decorator_ids.add(decorator_id)
+            framework, intent = classify_decorator(parsed.expression)
+            decorators.append(
+                DecoratorRecord(
+                    decorator_id=decorator_id,
+                    expression=parsed.expression,
+                    framework=framework,
+                    intent=intent,
+                    file_path=fn.file_path,
+                    line_number=parsed.line,
+                )
+            )
+    return tuple(decorators), tuple(edges)
+
+
+def _decorator_merge_key(*, file_path: str, line_number: int, expression: str) -> str:
+    """Deterministic, compact id derived from the MERGE key tuple."""
+
+    raw = f"{file_path}:{line_number}:{expression}"
+    return f"deco::{hashlib.sha1(raw.encode('utf-8')).hexdigest()[:16]}"
+
+
+def _with_sink_label(
+    record: FunctionRecord, sink_kind: str | None
+) -> FunctionRecord:
+    """Return `record` with sink label fields populated when
+    `sink_kind` is non-None, else the record unchanged."""
+
+    if sink_kind is None:
+        return record
+    return FunctionRecord(
+        function_id=record.function_id,
+        name=record.name,
+        qualified_name=record.qualified_name,
+        file_path=record.file_path,
+        module_name=record.module_name,
+        start_line=record.start_line,
+        end_line=record.end_line,
+        source=record.source,
+        summary=record.summary,
+        business_context=record.business_context,
+        trust_boundary=record.trust_boundary,
+        class_id=record.class_id,
+        is_external=record.is_external,
+        is_well_known_sink=True,
+        sink_kind=sink_kind,
+    )
+
+
+def _synthesize_sink_stubs(
+    *,
+    calls: Iterable["DiscoveredCall"],
+    parsed_qualified_names: set[str],
+    sink_set: dict[str, str],
+) -> tuple[FunctionRecord, ...]:
+    """Build stub `FunctionRecord` instances for external sink calls.
+
+    Today's resolver drops calls with no parsed callee. For sink
+    targets we instead synthesize a stub `Function` node so the
+    resolver finds it AND the edge lands in the graph AND
+    SinkAuditUnit enumeration can later anchor on it.
+
+    Returns a tuple of stub records, one per distinct external
+    sink FQN found in the calls. Stubs carry `is_external=True`
+    so downstream consumers can distinguish them from parsed
+    Function nodes (the audit's source-snippet rendering, e.g.,
+    short-circuits for stubs since `source=""`).
+    """
+
+    if not sink_set:
+        return ()
+    seen_fqns: set[str] = set()
+    stubs: list[FunctionRecord] = []
+    for call in calls:
+        fqn = call.callee_qualified_name
+        if not fqn or fqn in parsed_qualified_names or fqn in seen_fqns:
+            continue
+        sink_kind = sink_set.get(fqn)
+        if sink_kind is None:
+            continue
+        seen_fqns.add(fqn)
+        # The stub gets a `function_id` derived from the FQN so it
+        # collides on re-graph-build (idempotent MERGE on Neo4j
+        # side via the existing `function_key` MERGE rule).
+        stub_id = f"external::{fqn}"
+        # Modules are reconstructed from File nodes at audit time;
+        # use a synthetic `module_name = "<external>"` and
+        # `file_path = "external://<fqn>"` so downstream code
+        # ((file lookup, snippet rendering) can detect the stub
+        # without changing schemas.
+        stubs.append(
+            FunctionRecord(
+                function_id=stub_id,
+                name=fqn.rsplit(".", 1)[-1] if "." in fqn else fqn,
+                qualified_name=fqn,
+                file_path=f"external://{fqn}",
+                module_name=fqn.rsplit(".", 1)[0] if "." in fqn else "<external>",
+                start_line=0,
+                end_line=0,
+                source="",
+                is_external=True,
+                is_well_known_sink=True,
+                sink_kind=sink_kind,
+            )
+        )
+    return tuple(stubs)

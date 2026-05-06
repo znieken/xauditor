@@ -160,16 +160,24 @@ class RunsListBatchedMetricsTests(LiveDatabaseTestCase):
         body = response.json()
         self.assertEqual(body["total"], 2)
 
-        # Run A: no annotations -> validator-base.
+        # Run A: no annotations -> Valid bucket retains its agent base of
+        # 1; ``false_positives`` is feedback-derived and lacks any
+        # ``label='false_positive'`` row, so it stays at 0 even though
+        # one finding's ``validation_status`` is "False Positive".
         row_a = self._row_for(body, run_a_id)
         self.assertEqual(row_a["valid_findings"], 1)
-        self.assertEqual(row_a["false_positives"], 1)
+        self.assertEqual(row_a["false_positives"], 0)
         self.assertEqual(row_a["duplicate_findings"], 0)
         self.assertEqual(row_a["unlabeled_findings"], 2)
+        # `portal-show-stages-form`: every run row carries the
+        # `stages_form` field; runs the seed inserts without setting
+        # it land on the column default `'prompt'`.
+        self.assertEqual(row_a["stages_form"], "prompt")
 
         # Run B: Valid finding marked duplicate, FP finding marked TP.
         # Valid bucket: base 1 + 0 added - 0 removed - 1 dup = 0.
-        # FP bucket: base 1 + 0 added - 1 removed - 0 dup = 0.
+        # ``false_positives`` is feedback-derived and no annotation has
+        # ``label='false_positive'`` here, so it's 0.
         # Duplicate finding count = 1.
         # Unlabeled = 0 (both findings have annotation rows with
         # non-unlabeled labels).
@@ -178,6 +186,7 @@ class RunsListBatchedMetricsTests(LiveDatabaseTestCase):
         self.assertEqual(row_b["false_positives"], 0)
         self.assertEqual(row_b["duplicate_findings"], 1)
         self.assertEqual(row_b["unlabeled_findings"], 0)
+        self.assertEqual(row_b["stages_form"], "prompt")
 
 
 if __name__ == "__main__":

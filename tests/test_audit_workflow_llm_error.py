@@ -53,8 +53,8 @@ class _FailingAnalyzer:
         self._fail = fingerprint_to_fail
         self.calls: list[str] = []
 
-    def run(self, *, unit, path_functions, path_context=None):
-        del path_functions, path_context
+    def run(self, *, unit, path_functions, path_context=None, excluded_findings=()):
+        del path_functions, path_context, excluded_findings
         fp = unit.path.path_fingerprint
         self.calls.append(fp)
         if fp == self._fail:
@@ -89,7 +89,7 @@ class _SuccessValidator:
     def __init__(self) -> None:
         self.calls: list[str] = []
 
-    def run(self, *, unit, analyzer, exploitation, path_context=None):
+    def run(self, *, unit, analyzer, exploitation=None, path_context=None):
         del analyzer, exploitation, path_context
         self.calls.append(unit.path.path_fingerprint)
         return ValidationResult(status=ValidationStatus.VALID, analysis="Validated")

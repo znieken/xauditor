@@ -92,7 +92,12 @@ from xauditor.audit.markdown_payload import (
     render_exploitation_markdown,
     render_validator_markdown,
 )
-from xauditor.config import LLMSettings, TeamingConfig
+from xauditor.config import (
+    AuditAnalyzerStageConfig,
+    AuditExploiterStageConfig,
+    AuditValidatorStageConfig,
+    LLMSettings,
+)
 from xauditor.langchain_support import invoke_agent
 from xauditor.llm_outputs import (
     AnalyzerOutput,
@@ -115,8 +120,6 @@ from xauditor.prompts import (
     VALIDATOR_DEBATE_PROMPT,
     VALIDATOR_PROMPT,
     VALIDATOR_PROMPT_VERSION,
-    VALIDATOR_TEAMING_PROMPT,
-    VALIDATOR_TEAMING_PROMPT_VERSION,
 )
 from xauditor.runtime_logging import RuntimeLogger
 
@@ -164,7 +167,23 @@ class AnalyzerAgent:
         path_context: dict[str, object] | None = None,
         subagent_id: int | None = None,
         provider_name: str | None = None,
+        excluded_findings: tuple[dict[str, object], ...] = (),
     ) -> AnalyzerResult:
+        """Invoke the analyzer agent for a single audit unit.
+
+        ``excluded_findings`` lists candidate-finding summaries that
+        have already been recorded for this audit unit. The analyzer
+        prompt instructs the model to return one ADDITIONAL distinct
+        candidate, OR ``status: "no_issue"`` when the unit holds no
+        further candidate. Each entry in ``excluded_findings`` is
+        a ``{finding_name, suspect_function_id, suspect_line}`` dict
+        — the same exact-match key used by the dedup pipeline.
+
+        When ``excluded_findings`` is empty (the default), the prompt
+        behaves as it always did — the v4 system prompt skips the
+        excluded-findings clause when the array is empty.
+        """
+
         def _parse_response(response: dict[str, object]) -> AnalyzerResult:
             suspect_line = response.get("suspect_line", 0)
             try:
@@ -200,6 +219,8 @@ class AnalyzerAgent:
             payload["call_chain"] = path_context.get("call_chain", [])
             payload["function_definitions"] = path_context.get("function_definitions", [])
             payload["referenced_symbols"] = path_context.get("referenced_symbols", [])
+        if excluded_findings:
+            payload["excluded_findings"] = list(excluded_findings)
         result, _meta = invoke_agent(
             agent_name="analyzer",
             system_prompt=ANALYZER_PROMPT,
@@ -218,6 +239,7 @@ class AnalyzerAgent:
                 provider=provider_name or _meta.get("provider_name"),
                 prompt_version=_meta["prompt_version"],
                 subagent_id=subagent_id if subagent_id is not None else "",
+                excluded_findings_count=len(excluded_findings),
             )
         return result
 
@@ -299,9 +321,22 @@ class ValidatorAgent:
         *,
         unit: AuditUnit,
         analyzer: AnalyzerResult,
-        exploitation: ExploitationResult,
+        exploitation: ExploitationResult | None = None,
         path_context: dict[str, object] | None = None,
     ) -> ValidationResult:
+        """Validate an analyzer-produced candidate finding.
+
+        ``exploitation`` is accepted for backward compatibility but is
+        IGNORED — after `restructure-audit-modes-and-coverage` Phase
+        1B's stage reorder, the validator runs BEFORE the exploiter
+        (in every mode) so exploitation context is never available
+        when this method is called. The argument is retained as
+        ``Optional`` so legacy callers that still pass it don't
+        break; callers should drop the kwarg.
+        """
+
+        del exploitation  # explicitly ignored; see docstring
+
         def _parse_response(response: dict[str, object]) -> ValidationResult:
             status_value = str(response.get("status", ValidationStatus.INCONCLUSIVE.value)).strip()
             normalized = {
@@ -334,8 +369,6 @@ class ValidatorAgent:
             "description": analyzer.description,
             "reason": analyzer.reason,
             "evidence_strength": analyzer.evidence_strength,
-            "exploitation_status": exploitation.status,
-            "exploitation_steps": exploitation.steps,
         }
         if path_context is not None:
             payload["call_chain"] = path_context.get("call_chain", [])
@@ -410,15 +443,23 @@ class ValidatorAgent:
             payload["referenced_symbols"] = path_context.get("referenced_symbols", [])
         if debate_memory is not None:
             payload["debate_memory"] = debate_memory.snapshot()
+        # After `restructure-audit-modes-and-coverage` Phase 1B's stage
+        # reorder, the regular `validator` prompt no longer sees
+        # exploitation context in any mode — making the previous
+        # teaming-specific carve-out (`validator_teaming` v1)
+        # redundant. Both single and teaming code paths now share
+        # the `validator` v3 prompt; the only teaming-specific
+        # behaviour is the multi-replica fan-out + debate, both of
+        # which live in the orchestration layer above this method.
         result, meta = invoke_agent(
             agent_name="validator-teaming",
-            system_prompt=VALIDATOR_TEAMING_PROMPT,
+            system_prompt=VALIDATOR_PROMPT,
             payload=payload,
             chat_model=self.chat_model,
             logger=self.logger,
             response_model=ValidationOutput,
             response_parser=_parse_response,
-            prompt_version=VALIDATOR_TEAMING_PROMPT_VERSION,
+            prompt_version=VALIDATOR_PROMPT_VERSION,
             user_message=render_validator_markdown(payload),
         )
         if self.logger is not None:
@@ -704,18 +745,58 @@ def _exploit_to_judge(record: ExploiterSubagentRecord) -> dict:
     return {"status": record.result.status, "steps": record.result.steps}
 
 
+def _synth_validator_from_context(
+    validator_context: dict[str, object] | None,
+) -> ValidationResult:
+    """Synthesize a `ValidationResult` from a validator_context dict.
+
+    `wire-agentic-into-workflow` Phase 2 — `ExploiterTeam` previously
+    passed `validator_context` to `ExploitationAgent.run(...)` as an
+    extra payload, but `AgenticStageRunner.run_exploiter(...)`
+    requires a typed `ValidationResult`. Bridge by reconstructing one
+    from the context dict (or default to Inconclusive when missing).
+    """
+
+    if not validator_context:
+        return ValidationResult(status=ValidationStatus.INCONCLUSIVE, analysis="")
+    raw_status = str(validator_context.get("validator_verdict", "")).strip()
+    status_map = {
+        "Valid": ValidationStatus.VALID,
+        "Partial Valid": ValidationStatus.PARTIAL_VALID,
+        "Inconclusive": ValidationStatus.INCONCLUSIVE,
+        "False Positive": ValidationStatus.FALSE_POSITIVE,
+    }
+    status = status_map.get(raw_status, ValidationStatus.INCONCLUSIVE)
+    analysis = str(validator_context.get("validator_analysis", "") or "")
+    return ValidationResult(status=status, analysis=analysis)
+
+
 class AnalyzerTeam:
     def __init__(
         self,
         *,
-        teaming: TeamingConfig,
+        stage_cfg: AuditAnalyzerStageConfig,
+        replication: int,
         llm: LLMSettings,
         logger: RuntimeLogger | None = None,
+        agentic_stage_runner: object | None = None,
+        personas: tuple = (),
     ) -> None:
-        self.teaming = teaming
+        self.stage_cfg = stage_cfg
+        self.replication = max(1, replication)
         self.llm = llm
         self.logger = logger
         self._cancellation: "RunCancellation | None" = None
+        # `wire-agentic-into-workflow` Phase 2 — when set, per-replica
+        # `_invoke(...)` dispatches through this stage runner (a real
+        # `AgenticStageRunner` from the workflow's `from_config`)
+        # instead of constructing per-replica `AnalyzerAgent`
+        # instances. `personas` is the resolved persona tuple
+        # (length == replication); each replica's call carries
+        # `personas[index]` so the agent system prompt diverges
+        # per-replica even though the underlying transport is shared.
+        self.agentic_stage_runner = agentic_stage_runner
+        self.personas = personas
 
     def set_cancellation(self, cancellation: "RunCancellation | None") -> None:
         """Inject the run-level cancellation token; called by ``AuditWorkflow``."""
@@ -728,46 +809,76 @@ class AnalyzerTeam:
         path_functions: list[FunctionRecord],
         path_context: dict[str, object] | None = None,
     ) -> tuple[list[AnalyzerResult], list[AnalyzerSubagentRecord]]:
-        analyzer_cfg = self.teaming.analyzer
-        subagent_models = _build_subagent_models(
-            analyzer_cfg.provider_list,
-            analyzer_cfg.subagent_count,
-            self.llm,
-            agent_role="auditor",
-        )
         records: list[AnalyzerSubagentRecord] = []
 
-        def _invoke(index: int, model: ChatModel) -> AnalyzerSubagentRecord:
-            agent = AnalyzerAgent(chat_model=model, logger=self.logger)
-            result = agent.run(
-                unit=unit,
-                path_functions=path_functions,
-                path_context=path_context,
-                subagent_id=index,
-                provider_name=model.provider_name,
-            )
-            return AnalyzerSubagentRecord(
-                subagent_index=index,
-                provider_name=model.provider_name,
-                model_name=model.model_name,
-                result=result,
-            )
+        if self.agentic_stage_runner is not None:
+            # Agentic dispatch — per-replica diversity via persona
+            # injection; transport (coder-service `/agent_invocations`)
+            # is shared across replicas, so per-provider per-model
+            # rotation is irrelevant.
+            replica_count = self.replication
 
-        try:
-            with ThreadPoolExecutor(max_workers=max(1, analyzer_cfg.subagent_count)) as pool:
-                futures = [pool.submit(_invoke, idx, model) for idx, model in enumerate(subagent_models)]
+            def _invoke_agentic(index: int) -> AnalyzerSubagentRecord:
+                persona = self.personas[index] if index < len(self.personas) else None
+                result = self.agentic_stage_runner.run_analyzer(
+                    unit=unit,
+                    path_functions=path_functions,
+                    path_context=path_context,
+                    persona=persona,
+                    subagent_id=index,
+                )
+                return AnalyzerSubagentRecord(
+                    subagent_index=index,
+                    provider_name="coder-service",
+                    model_name=getattr(persona, "name", "") if persona else "",
+                    result=result,
+                )
+
+            with ThreadPoolExecutor(max_workers=replica_count) as pool:
+                futures = [pool.submit(_invoke_agentic, idx) for idx in range(replica_count)]
                 records.extend(
                     _run_subagents_with_cancel(pool, futures, self._cancellation)
                 )
-        finally:
-            subagent_models.clear()
-        records.sort(key=lambda record: record.subagent_index)
+            records.sort(key=lambda record: record.subagent_index)
+        else:
+            subagent_models = _build_subagent_models(
+                self.stage_cfg.provider_list,
+                self.replication,
+                self.llm,
+                agent_role="auditor",
+            )
+
+            def _invoke(index: int, model: ChatModel) -> AnalyzerSubagentRecord:
+                agent = AnalyzerAgent(chat_model=model, logger=self.logger)
+                result = agent.run(
+                    unit=unit,
+                    path_functions=path_functions,
+                    path_context=path_context,
+                    subagent_id=index,
+                    provider_name=model.provider_name,
+                )
+                return AnalyzerSubagentRecord(
+                    subagent_index=index,
+                    provider_name=model.provider_name,
+                    model_name=model.model_name,
+                    result=result,
+                )
+
+            try:
+                with ThreadPoolExecutor(max_workers=self.replication) as pool:
+                    futures = [pool.submit(_invoke, idx, model) for idx, model in enumerate(subagent_models)]
+                    records.extend(
+                        _run_subagents_with_cancel(pool, futures, self._cancellation)
+                    )
+            finally:
+                subagent_models.clear()
+            records.sort(key=lambda record: record.subagent_index)
 
         candidates = [record for record in records if record.result.status == "candidate"]
         if not candidates:
             return [], records
 
-        judge_provider = analyzer_cfg.provider_list[0]
+        judge_provider = self.stage_cfg.provider_list[0]
         judge_provider_config = self.llm.providers.get(judge_provider)
         if judge_provider_config is None:
             raise ValueError(f"Unknown analyzer judge provider `{judge_provider}`.")
@@ -793,11 +904,13 @@ class ValidatorTeam:
     def __init__(
         self,
         *,
-        teaming: TeamingConfig,
+        stage_cfg: AuditValidatorStageConfig,
+        replication: int,
         llm: LLMSettings,
         logger: RuntimeLogger | None = None,
     ) -> None:
-        self.teaming = teaming
+        self.stage_cfg = stage_cfg
+        self.replication = max(1, replication)
         self.llm = llm
         self.logger = logger
         self._cancellation: "RunCancellation | None" = None
@@ -813,10 +926,9 @@ class ValidatorTeam:
         path_context: dict[str, object] | None,
         finding_fingerprint: str,
     ) -> tuple[ValidationResult, list[ValidatorSubagentRecord], DebateTranscript | None]:
-        validator_cfg = self.teaming.validator
         subagent_models = _build_subagent_models(
-            validator_cfg.provider_list,
-            validator_cfg.subagent_count,
+            self.stage_cfg.provider_list,
+            self.replication,
             self.llm,
             agent_role="validator",
         )
@@ -839,7 +951,7 @@ class ValidatorTeam:
             )
 
         try:
-            with ThreadPoolExecutor(max_workers=max(1, validator_cfg.subagent_count)) as pool:
+            with ThreadPoolExecutor(max_workers=self.replication) as pool:
                 futures = [pool.submit(_invoke, idx, model) for idx, model in enumerate(subagent_models)]
                 records.extend(
                     _run_subagents_with_cancel(pool, futures, self._cancellation)
@@ -860,7 +972,7 @@ class ValidatorTeam:
                 records=records,
                 subagent_models=subagent_models,
                 finding_fingerprint=finding_fingerprint,
-                rounds=validator_cfg.debate_rounds,
+                rounds=self.stage_cfg.debate.max_rounds,
             )
             final_status_text = (transcript.final_verdict or "").strip().lower()
             status_map = {
@@ -993,14 +1105,24 @@ class ExploiterTeam:
     def __init__(
         self,
         *,
-        teaming: TeamingConfig,
+        stage_cfg: AuditExploiterStageConfig,
+        replication: int,
         llm: LLMSettings,
         logger: RuntimeLogger | None = None,
+        agentic_stage_runner: object | None = None,
+        personas: tuple = (),
     ) -> None:
-        self.teaming = teaming
+        self.stage_cfg = stage_cfg
+        self.replication = max(1, replication)
         self.llm = llm
         self.logger = logger
         self._cancellation: "RunCancellation | None" = None
+        # `wire-agentic-into-workflow` Phase 2 — same pattern as
+        # AnalyzerTeam: when set, per-replica `_invoke(...)` dispatches
+        # through this stage runner instead of constructing
+        # `ExploitationAgent` per replica.
+        self.agentic_stage_runner = agentic_stage_runner
+        self.personas = personas
 
     def set_cancellation(self, cancellation: "RunCancellation | None") -> None:
         self._cancellation = cancellation
@@ -1013,43 +1135,75 @@ class ExploiterTeam:
         path_context: dict[str, object] | None,
         validator_context: dict[str, object] | None = None,
     ) -> tuple[ExploitationResult, list[ExploiterSubagentRecord]]:
-        exploiter_cfg = self.teaming.exploiter
-        subagent_models = _build_subagent_models(
-            exploiter_cfg.provider_list,
-            exploiter_cfg.subagent_count,
-            self.llm,
-            agent_role="exploitation",
-        )
         records: list[ExploiterSubagentRecord] = []
 
-        def _invoke(index: int, model: ChatModel) -> ExploiterSubagentRecord:
-            agent = ExploitationAgent(chat_model=model, logger=self.logger)
-            result = agent.run(
-                unit=unit,
-                analyzer=analyzer,
-                path_context=path_context,
-                subagent_id=index,
-                provider_name=model.provider_name,
-                extra_payload=dict(validator_context) if validator_context else None,
-            )
-            return ExploiterSubagentRecord(
-                subagent_index=index,
-                provider_name=model.provider_name,
-                model_name=model.model_name,
-                result=result,
-            )
+        if self.agentic_stage_runner is not None:
+            # Agentic dispatch — per-replica diversity via personas;
+            # the agentic runner's `run_exploiter` requires a
+            # `validator: ValidationResult` arg, so we synthesize one
+            # from the validator_context (or an empty default if not
+            # provided).
+            replica_count = self.replication
+            synth_validator = _synth_validator_from_context(validator_context)
 
-        try:
-            with ThreadPoolExecutor(max_workers=max(1, exploiter_cfg.subagent_count)) as pool:
-                futures = [pool.submit(_invoke, idx, model) for idx, model in enumerate(subagent_models)]
+            def _invoke_agentic(index: int) -> ExploiterSubagentRecord:
+                persona = self.personas[index] if index < len(self.personas) else None
+                result = self.agentic_stage_runner.run_exploiter(
+                    unit=unit,
+                    analyzer=analyzer,
+                    validator=synth_validator,
+                    path_context=path_context,
+                    persona=persona,
+                )
+                return ExploiterSubagentRecord(
+                    subagent_index=index,
+                    provider_name="coder-service",
+                    model_name=getattr(persona, "name", "") if persona else "",
+                    result=result,
+                )
+
+            with ThreadPoolExecutor(max_workers=replica_count) as pool:
+                futures = [pool.submit(_invoke_agentic, idx) for idx in range(replica_count)]
                 records.extend(
                     _run_subagents_with_cancel(pool, futures, self._cancellation)
                 )
-        finally:
-            subagent_models.clear()
-        records.sort(key=lambda record: record.subagent_index)
+            records.sort(key=lambda record: record.subagent_index)
+        else:
+            subagent_models = _build_subagent_models(
+                self.stage_cfg.provider_list,
+                self.replication,
+                self.llm,
+                agent_role="exploitation",
+            )
 
-        judge_provider = exploiter_cfg.provider_list[0]
+            def _invoke(index: int, model: ChatModel) -> ExploiterSubagentRecord:
+                agent = ExploitationAgent(chat_model=model, logger=self.logger)
+                result = agent.run(
+                    unit=unit,
+                    analyzer=analyzer,
+                    path_context=path_context,
+                    subagent_id=index,
+                    provider_name=model.provider_name,
+                    extra_payload=dict(validator_context) if validator_context else None,
+                )
+                return ExploiterSubagentRecord(
+                    subagent_index=index,
+                    provider_name=model.provider_name,
+                    model_name=model.model_name,
+                    result=result,
+                )
+
+            try:
+                with ThreadPoolExecutor(max_workers=self.replication) as pool:
+                    futures = [pool.submit(_invoke, idx, model) for idx, model in enumerate(subagent_models)]
+                    records.extend(
+                        _run_subagents_with_cancel(pool, futures, self._cancellation)
+                    )
+            finally:
+                subagent_models.clear()
+            records.sort(key=lambda record: record.subagent_index)
+
+        judge_provider = self.stage_cfg.provider_list[0]
         judge_provider_config = self.llm.providers.get(judge_provider)
         if judge_provider_config is None:
             raise ValueError(f"Unknown exploiter judge provider `{judge_provider}`.")

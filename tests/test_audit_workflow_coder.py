@@ -48,7 +48,8 @@ def main():
 
 
 class _StubAnalyzer:
-    def run(self, *, unit, path_functions, path_context=None, subagent_id=None, provider_name=None):
+    def run(self, *, unit, path_functions, path_context=None, subagent_id=None, provider_name=None, excluded_findings=()):
+        del subagent_id, provider_name, excluded_findings
         return AnalyzerResult(
             status="candidate",
             finding_name="Command Injection",
@@ -66,7 +67,8 @@ class _StubExploitation:
 
 
 class _StubValidator:
-    def run(self, *, unit, analyzer, exploitation, path_context=None):
+    def run(self, *, unit, analyzer, exploitation=None, path_context=None):
+        del unit, analyzer, exploitation, path_context
         return ValidationResult(status=ValidationStatus.VALID, analysis="Validated")
 
 

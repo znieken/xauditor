@@ -100,6 +100,31 @@ class FunctionRecord:
     business_context: str = ""
     trust_boundary: str = ""
     class_id: str | None = None
+    # `capture-decorators-and-registrations` Commit 2 — stub
+    # FunctionRecords for external (stdlib / third-party) calls
+    # that the parser couldn't resolve to a parsed function. Set
+    # by `canonical.py`'s sink-stub synthesis pass when the
+    # call's target qualified_name is in the resolved
+    # `audit.sinks.{well_known,custom}` set. Stub records carry
+    # `source=""`, `summary=""`, etc.; their only purpose is to
+    # give the sink a Function-node identity so SinkAuditUnit
+    # enumeration can anchor on it.
+    is_external: bool = False
+    is_well_known_sink: bool = False
+    # `capture-decorators-and-registrations` Commit F. True when
+    # the method body assigns to `self.<attr>` (direct, annotated,
+    # or augmented). Computed at parse time by Python's
+    # `_detect_self_mutation`. Used by the planner's
+    # StateAuditUnit emission to anchor on classes whose methods
+    # collectively mutate instance state. Default False keeps
+    # non-Python parsers and module-level functions inert.
+    mutates_self: bool = False
+    # `sink_kind` matches the sink_labelling.SINK_KINDS literal set
+    # (`"subprocess"` / `"command"` / `"deserializer"` /
+    # `"http_client"` / `"sql"` / `"filesystem"` / `"rendering"`),
+    # or `""` for operator-defined custom sinks that didn't carry
+    # an explicit kind.
+    sink_kind: str = ""
 
 
 @dataclass(frozen=True)
@@ -122,6 +147,97 @@ class FunctionSymbolUseEdge:
     symbol_id: str
     line_number: int
     evidence: str
+
+
+@dataclass(frozen=True)
+class DecoratorRecord:
+    """One `Decorator` graph node — `capture-decorators-and-registrations`.
+
+    Decorators are syntactic markers, not callable actors — the
+    node carries source-text + framework + intent labels.
+    Multiple `Function` nodes can share a `Decorator` node when
+    the source uses the same expression at the same source
+    location, but in practice each function declaration has its
+    own decorator instances; the MERGE key is `(file_path,
+    line_number, expression)` to keep re-graph-build idempotent.
+
+    `framework` and `intent` come from
+    `xauditor.graph.framework_heuristics.classify_decorator(...)`
+    pattern matching against `expression`. Both are empty
+    strings when no pattern matches.
+    """
+
+    decorator_id: str
+    expression: str
+    framework: str
+    intent: str
+    file_path: str
+    line_number: int
+
+
+@dataclass(frozen=True)
+class RegistrationSiteRecord:
+    """One framework registration call site —
+    `capture-decorators-and-registrations` Phase 1.3.
+
+    Holds the source-text + framework + intent labels for a
+    `<callable>.add_url_rule(...)` / `path(...)` /
+    `add_event_handler(...)` etc. call site. The
+    `(:RegistrationSite)-[:REGISTERS]->(:Function)` edge
+    (`FunctionRegistrationEdge`) connects the site to the
+    function it registers.
+
+    `framework` and `intent` mirror the values used by
+    `DecoratorRecord` so downstream code (entry classification,
+    GraphSlice population) can branch uniformly on either
+    source. MERGE key is `(file_path, line_number, expression)`
+    keeping re-graph-build idempotent.
+    """
+
+    registration_id: str
+    framework: str
+    intent: str
+    expression: str
+    file_path: str
+    line_number: int
+
+
+@dataclass(frozen=True)
+class FunctionRegistrationEdge:
+    """`(:RegistrationSite)-[:REGISTERS]->(:Function)` edge.
+
+    Every registration site emits one edge per registered
+    function. A single site that registers multiple functions
+    (rare; e.g. `path('users/', views.handle_users)` only
+    registers one) emits one edge per resolved function.
+    """
+
+    registration_id: str
+    function_id: str
+
+
+@dataclass(frozen=True)
+class FunctionDecoratorEdge:
+    """`(:Function)-[:HAS_DECORATOR {position}]->(:Decorator)` edge.
+
+    `position` is 0-indexed bottom-up: position 0 is the
+    decorator closest to the function definition, applied
+    FIRST at runtime. Matches Python's actual application
+    order so a chain like::
+
+        @login_required          # position 2
+        @app.route("/users")     # position 1
+        @rate_limit(per_minute=60)  # position 0
+        def list_users(): ...
+
+    surfaces the entry-binding decorator (`@app.route`) at
+    position 1 and the rate-limit at position 0 (closest to
+    the function body, applied first).
+    """
+
+    function_id: str
+    decorator_id: str
+    position: int
 
 
 @dataclass(frozen=True)
@@ -301,6 +417,18 @@ class Finding:
     coder_analysis: str = ""
     coder_reason: str = ""
     coder_call_chain_evidence: tuple[CoderEvidence, ...] = ()
+    # `wire-agentic-into-workflow` Phase 3 — populated when the
+    # finding was produced under `audit.stages.form: agentic`. Each
+    # entry is one stage's transport transcript (analyzer / validator
+    # / exploiter), shaped per `AgentResult.transcript_as_payload`.
+    # Empty tuple under prompt mode.
+    agentic_transcript: tuple[dict[str, object], ...] = ()
+    # `restructure-audit-modes-and-coverage` Phase 5A + workflow
+    # wiring in `wire-agentic-into-workflow` — populated by the
+    # cross-unit reconciler at run end. Shape: `{per_unit_verdicts,
+    # consolidated_verdict, consolidation_reasoning}`. None for
+    # findings emitted before reconciliation completed.
+    reconciliation: dict[str, object] | None = None
 
 
 @dataclass(frozen=True)

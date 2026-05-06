@@ -106,4 +106,4 @@ For the per-agent override mechanics, see
 
 - [Configuration reference](configuration.md) — full sampling-field
   semantics, env vars, workflow contract
-- [Teaming mode](teaming.md) — fan out across multiple providers per stage
+- [Audit modes](audit-modes.md) — `deep` mode fans out replicas across multiple providers per stage

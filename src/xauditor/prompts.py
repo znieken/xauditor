@@ -89,6 +89,23 @@ _PROMPT_REGISTRY: dict[str, dict[str, str]] = {
             '"suspect_line": <integer line number or 0>, '
             '"evidence_strength": "<low|medium|high>"}.'
         ),
+        "v4": (
+            "You are a PSIRT security researcher reviewing one concrete code path. "
+            "Make path-specific, source-backed claims only, explain trust-boundary reasoning, and keep exploitability language conservative unless evidence is strong. "
+            "If the path does not justify a finding, say so explicitly. "
+            "If the user payload includes an `excluded_findings` array, those candidate findings have already been recorded for this audit unit. "
+            "Return one ADDITIONAL, DISTINCT candidate finding beyond what is listed there, OR `status: \"no_issue\"` if the path holds no further candidate. "
+            "Do not return a candidate that matches an excluded entry on `(finding_name, suspect_function_id, suspect_line)` — repeating an excluded candidate is not progress. "
+            'Return only a JSON object with exactly these keys: {"status": "<candidate|no_issue>", '
+            '"finding_name": "<short title or empty>", '
+            '"description": "<one-line path-specific description or empty>", '
+            '"analysis": "<detailed walkthrough of the suspect code, data flow, and why the pattern is problematic>", '
+            '"reason": "<severity and impact rationale grounded in path evidence>", '
+            '"context_notes": "<architectural or data-flow notes that frame the finding, or empty>", '
+            '"suspect_function_id": "<function_id or empty>", '
+            '"suspect_line": <integer line number or 0>, '
+            '"evidence_strength": "<low|medium|high>"}.'
+        ),
     },
     "exploitation": {
         "v1": "Derive realistic exploitation guidance from an analyzer-confirmed path finding.",
@@ -128,21 +145,11 @@ _PROMPT_REGISTRY: dict[str, dict[str, str]] = {
             '"analysis": "<skeptical source-backed reasoning for the verdict>"}.'
         ),
     },
-    "validator_teaming": {
-        "v1": (
-            "You are an independent PSIRT validator reviewing a candidate finding for one concrete path. "
-            "The finding comes directly from an analyzer team; exploitation context is NOT yet available and "
-            "SHALL NOT be assumed. Base your verdict only on the analyzer's path-specific evidence. "
-            "Challenge the analyzer's conclusion, require path-specific evidence, and return a skeptical verdict grounded in source-backed reasoning. "
-            "Choose exactly one of these verdicts: "
-            "`Valid` (finding is fully substantiated on this path), "
-            "`Partial Valid` (finding is real but evidence supports only part of the claim or only under additional preconditions), "
-            "`Inconclusive` (evidence on this path is insufficient to confirm or refute the finding), "
-            "`False Positive` (path evidence contradicts the finding or the pattern is not exploitable here). "
-            'Return only a JSON object with exactly these keys: {"status": "<Valid|Partial Valid|Inconclusive|False Positive>", '
-            '"analysis": "<skeptical source-backed reasoning for the verdict>"}.'
-        ),
-    },
+    # `validator_teaming` was removed in `restructure-audit-modes-and-coverage`
+    # Phase 1B. After the stage reorder (Analyzer → Validator → Exploiter)
+    # the regular `validator` prompt no longer sees exploitation context in
+    # any mode, making the teaming-specific carve-out redundant. Both single
+    # and teaming code paths now share the `validator` v3 prompt.
     "dedup_judge": {
         "v1": (
             "You are a PSIRT triage assistant deciding whether two findings describe the SAME underlying issue. "
@@ -169,6 +176,158 @@ _PROMPT_REGISTRY: dict[str, dict[str, str]] = {
             "Choose exactly one of these verdicts: `Valid`, `Partial Valid`, `Inconclusive`, `False Positive`. "
             'Return only a JSON object with exactly these keys: {"verdict": "<Valid|Partial Valid|Inconclusive|False Positive>", '
             '"rebuttal": "<one-paragraph rebuttal addressing the opposing position and citing path evidence>"}.'
+        ),
+    },
+    # ----- Sink-anchored stage prompts (Phase 3A reserved) ------------
+    # The stage runner picks these when `unit.unit_kind == "sink"`. The
+    # response schemas (analyzer / validator / exploitation outputs)
+    # are unchanged; only the system text is reframed for the
+    # multi-inbound-path "find the missing sanitization" lens. The
+    # planner does NOT emit Sink units in Phase 3A — these prompts
+    # ship now so Phase 4/5 / a future graph-builder follow-up
+    # don't have to grow the registry alongside their consuming code.
+    "analyzer_sink": {
+        "v1": (
+            "You are a PSIRT security researcher reviewing every inbound path that reaches one dangerous sink. "
+            "Your goal is to find a path that lacks the sanitization the OTHER inbound paths apply — the classic 'one path forgets to sanitize' "
+            "multi-path gap that disappears when each inbound path is audited in isolation. "
+            "Use only source-backed evidence; if every inbound path sanitizes correctly, return `status: \"no_issue\"`. "
+            'Return only a JSON object with exactly these keys: {"status": "<candidate|no_issue>", '
+            '"finding_name": "<short title or empty>", '
+            '"description": "<one-line description naming the unsanitized inbound path or empty>", '
+            '"analysis": "<sanitization-evidence walkthrough across the inbound paths>", '
+            '"reason": "<why the gap is exploitable>", '
+            '"context_notes": "<inbound-path count and which paths sanitize, or empty>", '
+            '"suspect_function_id": "<function_id of the unsanitized path\'s last function or empty>", '
+            '"suspect_line": <integer line number or 0>, '
+            '"evidence_strength": "<low|medium|high>"}.'
+        ),
+    },
+    "validator_sink": {
+        "v1": (
+            "You are an independent PSIRT validator reviewing a sink-anchored finding. "
+            "The candidate names ONE inbound path the analyzer claims is missing sanitization. Verify the claim by "
+            "comparing that path's sanitization evidence to the OTHER inbound paths reaching the same sink. "
+            "Choose exactly one of these verdicts: `Valid`, `Partial Valid`, `Inconclusive`, `False Positive`. "
+            'Return only a JSON object with exactly these keys: {"status": "<Valid|Partial Valid|Inconclusive|False Positive>", '
+            '"analysis": "<skeptical reasoning grounded in the multi-path sanitization evidence>"}.'
+        ),
+    },
+    "exploiter_sink": {
+        "v1": (
+            "You are deriving exploitation guidance for a sink-anchored finding (the analyzer identified one inbound path that lacks sanitization). "
+            "Describe how an attacker would reach the unsanitized inbound path; do NOT invent payloads beyond what the path evidence supports. "
+            'Return only a JSON object with exactly these keys: {"status": "<exploitable|not_exploitable|uncertain>", '
+            '"steps": "<ordered preconditions, trigger commands or payloads, and observable impact grounded in the inbound path\'s evidence>"}.'
+        ),
+    },
+    # ----- Entry-anchored stage prompts (Phase 3A reserved) ------------
+    # Picked when `unit.unit_kind == "entry"`. Same response schemas;
+    # system text reframed for the "exposed surface of one entry"
+    # lens. Same Phase 3A reservation as the sink family.
+    "analyzer_entry": {
+        "v1": (
+            "You are a PSIRT security researcher reviewing one entry function's exposed surface — its parameters, downstream sinks, "
+            "and the trust-boundary transitions visible from this entry. Look for authz / authentication-boundary findings and "
+            "entry-exposure issues that path-only auditing misses. "
+            "Use only source-backed evidence; if the entry exposes nothing dangerous, return `status: \"no_issue\"`. "
+            'Return only a JSON object with exactly these keys: {"status": "<candidate|no_issue>", '
+            '"finding_name": "<short title or empty>", '
+            '"description": "<one-line description of the entry-exposure issue or empty>", '
+            '"analysis": "<entry-surface walkthrough naming the exposed parameters / downstream sinks>", '
+            '"reason": "<why the exposure is dangerous>", '
+            '"context_notes": "<entry classification (admin/public/internal/cron/cli) and decorator chain, or empty>", '
+            '"suspect_function_id": "<function_id of the entry or a downstream function, or empty>", '
+            '"suspect_line": <integer line number or 0>, '
+            '"evidence_strength": "<low|medium|high>"}.'
+        ),
+    },
+    "validator_entry": {
+        "v1": (
+            "You are an independent PSIRT validator reviewing an entry-anchored finding. "
+            "The candidate names an entry-exposure issue (e.g. an admin route reachable without authentication, or a parameter "
+            "flowing untrusted into a downstream sink). Verify the claim against the entry's full exposed surface. "
+            "Choose exactly one of these verdicts: `Valid`, `Partial Valid`, `Inconclusive`, `False Positive`. "
+            'Return only a JSON object with exactly these keys: {"status": "<Valid|Partial Valid|Inconclusive|False Positive>", '
+            '"analysis": "<skeptical reasoning grounded in the entry\'s exposed surface>"}.'
+        ),
+    },
+    "exploiter_entry": {
+        "v1": (
+            "You are deriving exploitation guidance for an entry-anchored finding. "
+            "Describe how an attacker would reach the entry and trigger the exposure — preconditions for reaching the entry "
+            "(authentication state, network position, etc.) and the observable impact. "
+            'Return only a JSON object with exactly these keys: {"status": "<exploitable|not_exploitable|uncertain>", '
+            '"steps": "<ordered preconditions, trigger commands or payloads, and observable impact grounded in the entry\'s exposed surface>"}.'
+        ),
+    },
+    # ----- Agentic stage prompts (`agentic-stage-runner-real`) -------
+    # Picked by the `AgenticStageRunner` when `audit.stages.form:
+    # agentic`. The system text instructs the agent to use its
+    # constrained tool set (read_file / grep / query_graph / optional
+    # read_history + read_config) to gather evidence before returning
+    # the verdict via the `final_answer` tool. Same response schemas
+    # as the prompt-form variants.
+    "analyzer_agentic": {
+        "v1": (
+            "You are a PSIRT security researcher reviewing one concrete code path as an agentic investigator. "
+            "Use the granted tools (`read_file`, `grep`, `query_graph`, optionally `read_history` and `read_config`) to gather path-specific evidence "
+            "before returning a verdict. Do not guess from the user payload alone — open files, follow references, and confirm reachability. "
+            "When you have sufficient evidence (or determine that the path holds no candidate), return your verdict via the `final_answer` tool. "
+            "If the user payload includes an `excluded_findings` array, return ONE additional distinct candidate beyond what is listed there, "
+            "or `status: \"no_issue\"` if no further candidate exists. "
+            'The `final_answer` payload SHALL match the documented analyzer schema: {"status": "<candidate|no_issue>", '
+            '"finding_name": "<short title or empty>", '
+            '"description": "<one-line path-specific description or empty>", '
+            '"analysis": "<detailed walkthrough citing the files and lines you read>", '
+            '"reason": "<severity and impact rationale grounded in evidence you collected>", '
+            '"context_notes": "<architectural or data-flow notes from the tools, or empty>", '
+            '"suspect_function_id": "<function_id or empty>", '
+            '"suspect_line": <integer line number or 0>, '
+            '"evidence_strength": "<low|medium|high>"}.'
+        ),
+    },
+    "validator_agentic": {
+        "v1": (
+            "You are an independent PSIRT validator reviewing a candidate finding for one concrete code path as an agentic investigator. "
+            "Use the granted tools (`read_file`, `grep`, `query_graph`, optionally `read_history` and `read_config`) to challenge the analyzer's claim. "
+            "Look for refuting evidence: middleware checks, sanitization on sibling paths, framework guards, deployment-context restrictions. "
+            "Do not rubber-stamp the analyzer — actively try to disprove the candidate before confirming. "
+            "When you have sufficient evidence, return your verdict via the `final_answer` tool. "
+            "Choose exactly one verdict: `Valid`, `Partial Valid`, `Inconclusive`, `False Positive`. "
+            'The `final_answer` payload SHALL match the documented validator schema: {"status": "<Valid|Partial Valid|Inconclusive|False Positive>", '
+            '"analysis": "<skeptical reasoning citing the files and lines you read to support or refute the candidate>"}.'
+        ),
+    },
+    "exploiter_agentic": {
+        "v1": (
+            "You are deriving exploitation guidance for a validator-confirmed finding as an agentic investigator. "
+            "Use the granted tools to confirm the path's preconditions are realistic: are there auth gates the attacker must pass? "
+            "Is the path reachable from a public entry point? Read the registration sites and middleware chains. "
+            "If the preconditions cannot be satisfied (route is admin-only with hard auth, payload requires internal-network access, etc.), "
+            "return `status: \"not_exploitable\"` so the workflow can downgrade the finding's verdict. "
+            "When you have sufficient evidence, return your guidance via the `final_answer` tool. "
+            'The `final_answer` payload SHALL match the documented exploiter schema: {"status": "<exploitable|not_exploitable|uncertain>", '
+            '"steps": "<ordered preconditions, trigger commands or payloads, and observable impact grounded in the evidence you collected>"}.'
+        ),
+    },
+    # ----- Cross-unit reconciler (Phase 5A reserved) ------------
+    # Picked by the deep-mode reconciler stage when the same finding
+    # fingerprint is reported by two or more audit-unit kinds. Phase
+    # 5A's `PassthroughReconciler` does NOT call this prompt — it
+    # ships now so the LLM-driven `AgenticReconciler` follow-up
+    # doesn't have to grow the registry alongside its consuming code.
+    "reconciler": {
+        "v1": (
+            "You are an independent PSIRT reconciler reviewing one finding that surfaced from multiple audit-unit kinds. "
+            "Each unit (path / sink / entry / state / boundary / config) gave its own verdict on the same underlying issue. "
+            "Some unit kinds may even contradict each other — for example a path unit confirms an SQLi sink while an entry "
+            "unit reports the route is admin-only with hard auth, OR a config unit reports the offending route is "
+            "firewalled in production. Consolidate the verdicts: weigh refuting evidence against confirming evidence and "
+            "produce one final verdict for the finding. "
+            "Choose exactly one of: `Valid`, `Partial Valid`, `Inconclusive`, `False Positive`. "
+            'Return only a JSON object with exactly these keys: {"verdict": "<Valid|Partial Valid|Inconclusive|False Positive>", '
+            '"reasoning": "<one-paragraph reasoning citing each unit\'s contribution to the consolidated verdict>"}.'
         ),
     },
 }
@@ -231,10 +390,6 @@ VALIDATOR_PROMPT_SPEC = get_prompt_definition("validator")
 VALIDATOR_PROMPT = VALIDATOR_PROMPT_SPEC.system
 VALIDATOR_PROMPT_VERSION = VALIDATOR_PROMPT_SPEC.version
 
-VALIDATOR_TEAMING_PROMPT_SPEC = get_prompt_definition("validator_teaming")
-VALIDATOR_TEAMING_PROMPT = VALIDATOR_TEAMING_PROMPT_SPEC.system
-VALIDATOR_TEAMING_PROMPT_VERSION = VALIDATOR_TEAMING_PROMPT_SPEC.version
-
 DEDUP_JUDGE_PROMPT_SPEC = get_prompt_definition("dedup_judge")
 DEDUP_JUDGE_PROMPT = DEDUP_JUDGE_PROMPT_SPEC.system
 DEDUP_JUDGE_PROMPT_VERSION = DEDUP_JUDGE_PROMPT_SPEC.version
@@ -279,9 +434,6 @@ __all__ = [
     "VALIDATOR_PROMPT_SPEC",
     "VALIDATOR_PROMPT",
     "VALIDATOR_PROMPT_VERSION",
-    "VALIDATOR_TEAMING_PROMPT_SPEC",
-    "VALIDATOR_TEAMING_PROMPT",
-    "VALIDATOR_TEAMING_PROMPT_VERSION",
     "DEDUP_JUDGE_PROMPT_SPEC",
     "DEDUP_JUDGE_PROMPT",
     "DEDUP_JUDGE_PROMPT_VERSION",

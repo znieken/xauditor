@@ -274,38 +274,40 @@ def check_coder_http(
     )
 
 
-def resolve_coder_project(
-    coder_cfg: CoderConfig, *, repo_root: Path
-) -> str | None:
-    """Derive the multi-project ``project`` name for an audit run.
+def derive_project_from_workspace(
+    *,
+    workspace_root: str,
+    repo_root: Path,
+    override: str = "",
+) -> str:
+    """Pure helper: derive the in-container project name from the
+    operator's `workspace_root` mount and the audit target's
+    `repo_root`.
 
-    Returns ``None`` for the subprocess transport (which runs claude
-    with ``cwd=repo_root`` directly and has no project namespace).
-    Otherwise returns:
+    Used by both the verification coder (`resolve_coder_project`)
+    and the agentic stage runner (`build_stage_runner` under
+    `audit.stages.form: agentic`) so they pick the same project
+    name from the same audit invocation -- the agentic transport
+    and the verification coder typically talk to the same
+    coder-service container, so the project namespace is shared.
 
-    1. ``coder.project_name`` when explicitly set (operator override
-       always wins).
+    Resolution:
+
+    1. ``override`` always wins when non-empty.
     2. The ``/``-joined path of ``repo_root`` relative to
-       ``coder.workspace_root`` when both resolve cleanly and
+       ``workspace_root`` when both resolve cleanly and
        ``repo_root`` lies inside ``workspace_root``. With the
-       every-directory-is-a-project discovery walk this matches the
-       project name that ``GET /projects`` emits (e.g. ``team/repo``
-       for ``workspace_root=/ws`` and ``repo_root=/ws/team/repo``).
-    3. ``basename(realpath(repo_root))`` as the legacy fallback —
-       used when ``workspace_root`` is unset (single-repo container)
-       or when ``repo_root`` is not relative to ``workspace_root``
-       (mis-configured layout; the error path in
-       ``check_coder_projects`` then nudges the operator).
-
-    The deprecation shim populates ``effective_project_name`` from the
-    legacy ``repo_mount_path`` so case 1 still applies for old configs.
+       every-directory-is-a-project discovery walk this matches
+       the project name that ``GET /projects`` emits (e.g.
+       ``team/repo`` for ``workspace_root=/ws`` and
+       ``repo_root=/ws/team/repo``).
+    3. ``basename(realpath(repo_root))`` as the legacy fallback --
+       used when ``workspace_root`` is empty (single-repo
+       container) or when ``repo_root`` is not relative to
+       ``workspace_root`` (mis-configured layout).
     """
 
-    if not coder_cfg.enabled:
-        return None
-    if coder_cfg.transport != "http":
-        return None
-    explicit = (coder_cfg.effective_project_name or "").strip()
+    explicit = (override or "").strip()
     if explicit:
         return explicit
 
@@ -314,10 +316,10 @@ def resolve_coder_project(
     except OSError:
         return Path(repo_root).name
 
-    workspace_root = (coder_cfg.effective_workspace_root or "").strip()
-    if workspace_root:
+    workspace_root_str = (workspace_root or "").strip()
+    if workspace_root_str:
         try:
-            workspace_real = Path(os.path.realpath(workspace_root))
+            workspace_real = Path(os.path.realpath(workspace_root_str))
         except OSError:
             workspace_real = None
         if workspace_real is not None and repo_real != workspace_real:
@@ -329,6 +331,34 @@ def resolve_coder_project(
                 return rel.as_posix()
 
     return repo_real.name
+
+
+def resolve_coder_project(
+    coder_cfg: CoderConfig, *, repo_root: Path
+) -> str | None:
+    """Derive the multi-project ``project`` name for the
+    verification coder.
+
+    Returns ``None`` for the subprocess transport (which runs claude
+    with ``cwd=repo_root`` directly and has no project namespace),
+    or when the verification coder is disabled. Otherwise delegates
+    to ``derive_project_from_workspace`` for the actual derivation
+    (case 1: ``coder.project_name`` override, case 2: workspace_root
+    relative path, case 3: basename fallback).
+
+    The deprecation shim populates ``effective_project_name`` from the
+    legacy ``repo_mount_path`` so case 1 still applies for old configs.
+    """
+
+    if not coder_cfg.enabled:
+        return None
+    if coder_cfg.transport != "http":
+        return None
+    return derive_project_from_workspace(
+        workspace_root=coder_cfg.effective_workspace_root,
+        repo_root=repo_root,
+        override=coder_cfg.effective_project_name,
+    )
 
 
 def check_coder_projects(

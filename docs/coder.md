@@ -1,6 +1,6 @@
 # Coder verification (optional 4th agent)
 
-Both single-agent mode and [teaming mode](teaming.md) can dispatch a
+Both [`fast` and `deep` audit modes](audit-modes.md) can dispatch a
 fourth, **repo-global** verification stage — the **coder** — that
 reads the entire repository and judges whether each finding holds up
 against sibling-module evidence (sanitizers, capability checks,
@@ -328,6 +328,102 @@ Coder endpoint: http://127.0.0.1:8090 (kind=loopback)
 > `coder.workspace_root` + (optional) `coder.project_name` before the
 > version after next, when the shim is removed.
 
+## Agent invocations endpoint
+
+In addition to the per-finding `/verifications` job-pattern endpoint,
+xauditor-coder-service `1.1.0+` exposes a synchronous
+`POST /agent_invocations` endpoint for the agentic stage runner
+(`audit.stages.form: agentic` on the xauditor side). The endpoint is
+generic — it accepts a system prompt, user payload, and JSON Schema
+for the response, then runs the real `claude` CLI inside the
+container's sandbox and returns the validated structured response in
+the HTTP response body.
+
+| Property | `/verifications` | `/agent_invocations` |
+|---|---|---|
+| Lifecycle | async (submit + poll + cancel) | synchronous (long-poll) |
+| Idempotency keys | yes | no |
+| Response schema | coder-specific (verdict + analysis) | caller-supplied JSON Schema |
+| Tool grants | hardcoded to verification grants | unrestricted (container-level isolation only) |
+| Cancellation | DELETE /verifications/{id} | client disconnect |
+| Use case | per-finding verification | per-stage agentic call |
+
+**Request body**:
+
+```json
+{
+  "system_prompt": "<stage prompt>",
+  "user_payload": { ... arbitrary JSON ... },
+  "response_schema": { ... JSON Schema for the final answer ... },
+  "timeout_seconds": 300,
+  "project": "my-project"
+}
+```
+
+No `tool_grants` / `max_tool_calls` / `max_budget_usd` fields — the
+coder-service container is the security sandbox; `timeout_seconds` is
+the only enforceable per-call cost cap.
+
+**Response body** (200 OK):
+
+```json
+{
+  "final_answer": { ... validated against response_schema ... },
+  "transcript": [
+    {"tool": "Read", "input": {"path": "x.py"}, "output": "..."},
+    {"tool": "final_answer", "input": {...}, "output": null}
+  ],
+  "fell_back": false,
+  "fallback_reason": null,
+  "elapsed_seconds": 47.3
+}
+```
+
+**HTTP-vs-fallback semantics**:
+
+- **4xx**: malformed request, auth failure, unknown project, invalid
+  `response_schema` (FastAPI Pydantic validation). Caller fix.
+- **5xx**: coder-service infrastructure failure (semaphore acquisition
+  died, internal exception). Operator fix.
+- **200 OK with `fell_back: true`**: the request was valid, claude
+  ran, but didn't deliver a usable verdict. Reasons surfaced in
+  `fallback_reason`: `subprocess_exit_<N>`, `timeout`,
+  `schema_validation_failed: <details>`, `malformed_response`,
+  `empty_stdout`, `cancelled: client disconnected`,
+  `subprocess_spawn_failed: <details>`,
+  `invalid_response_schema: <details>`.
+
+The 200-vs-4xx-vs-5xx separation lets the xauditor side distinguish
+"the network/auth is broken" from "claude ran but didn't deliver"
+without ambiguity.
+
+**CLI invocation** (real `claude` CLI flags, not the imagined ones
+the original `agentic-stage-runner-real` design assumed):
+
+```bash
+claude -p \
+  --output-format json \
+  --json-schema "<schema>" \
+  --append-system-prompt "<system_prompt>" \
+  --add-dir "<project_dir>" \
+  < <(echo '<user_payload_json>')
+```
+
+The orchestrator pipes the user_payload as JSON via stdin (claude
+reads it as the prompt body), captures stdout (JSON envelope with
+final_answer + per-tool transcript), validates against the supplied
+response_schema, and returns the structured response.
+
+**Concurrency**: agent invocations and verifications share the same
+`asyncio.Semaphore(max_concurrent_jobs)`. Operators tune one knob
+(`XAUDITOR_CODER_SERVICE_MAX_CONCURRENT`) for total claude
+parallelism regardless of which endpoint dispatched the work.
+
+**Cancellation via client disconnect**: the FastAPI handler polls
+`request.is_disconnected()` at 0.5s cadence; on disconnect, the
+inner claude subprocess receives SIGTERM (then SIGKILL after a 2s
+grace if it hasn't exited).
+
 ## Future direction
 
 A queue-driven transport (`coder.transport: queue`, postgres-backed
@@ -364,7 +460,7 @@ override a configured value.
 
 - [Configuration reference](configuration.md) — full xauditor.yml
   schema and all env vars
-- [Teaming mode](teaming.md) — pairs naturally with coder
-  verification for analyst-grade rigor
+- [Audit modes](audit-modes.md) — `deep` mode pairs naturally
+  with coder verification for analyst-grade rigor
 - [`deploy/coder-service/README.md`](../deploy/coder-service/README.md)
   — sidecar / compose / k8s deployment walkthrough

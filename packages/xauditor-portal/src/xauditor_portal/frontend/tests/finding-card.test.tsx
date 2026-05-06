@@ -197,13 +197,13 @@ describe("FindingCard", () => {
     ).toBeInTheDocument();
   });
 
-  it("renders a Debate section for team-mode findings with has_debate=true", async () => {
+  it("renders a Debate section for deep-mode findings with has_debate=true", async () => {
     mockApi(detailPayload());
     renderWithProviders(
       <FindingCard
         finding={summary({ has_debate: true })}
         runId="run-1"
-        runMode="team"
+        runMode="deep"
         expanded={true}
         onToggle={() => {}}
       />,
@@ -215,13 +215,13 @@ describe("FindingCard", () => {
     // more mentions of "debate". Do not over-constrain the exact count.
   });
 
-  it("omits the Debate section in single-mode runs even when has_debate is true", async () => {
+  it("omits the Debate section in fast-mode runs even when has_debate is true", async () => {
     mockApi(detailPayload());
     renderWithProviders(
       <FindingCard
         finding={summary({ has_debate: true })}
         runId="run-1"
-        runMode="single"
+        runMode="fast"
         expanded={true}
         onToggle={() => {}}
       />,

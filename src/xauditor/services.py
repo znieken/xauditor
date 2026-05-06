@@ -989,9 +989,16 @@ class ApplicationServices:
         resumed: bool,
     ) -> RunMeta:
         auditor_provider_name, validator_provider_name, coder_preflight = providers
-        teaming_enabled = bool(
-            getattr(config, "teaming", None) and config.teaming.enabled
-        )
+        # The mode literal persisted onto ``audit_runs.mode`` is the
+        # canonical post-rename value (`"fast"` / `"deep"`). Migration
+        # 0011 has already rewritten any historical `"single"` /
+        # `"team"` rows in place. Read from ``config.audit_mode.mode``
+        # rather than the legacy ``config.teaming.enabled`` flag —
+        # operators using the legacy yaml shape have already had
+        # their config translated by ``_migrate_legacy_teaming`` at
+        # ``load_config`` time.
+        audit_mode = getattr(config, "audit_mode", None)
+        mode_label = audit_mode.mode if audit_mode is not None else "fast"
         providers_used: dict[str, Any] = {
             "auditor": auditor_provider_name,
             "validator": validator_provider_name,
@@ -1004,15 +1011,33 @@ class ApplicationServices:
             providers_used["coder"] = coder_preflight.as_provider_summary(
                 model_name=self.config.coder.model_name,
             )
+        # Phase 5A: compute the CoverageGaps payload at run start
+        # so the sink (Postgres) can persist it the moment the run
+        # row is opened. `compute_coverage_gaps` is data-only and
+        # cheap (~microseconds), no LLM, no Neo4j.
+        coverage_gaps_payload: dict[str, Any] | None = None
+        if audit_mode is not None and audit_mode.coverage_gaps_report:
+            from xauditor.coverage_gaps import compute_coverage_gaps
+
+            coverage_gaps_payload = compute_coverage_gaps(
+                mode=mode_label
+            ).to_payload()
+
+        stages_form = (
+            audit_mode.stages_form if audit_mode is not None else "prompt"
+        )
+
         return RunMeta(
             repo_root=str(self.repo_root),
             project_name=self.repo_root.name,
             build_fingerprint=source.build_fingerprint,
-            mode="team" if teaming_enabled else "single",
+            mode=mode_label,
             run_label=run_label,
             started_at=datetime.now(),
             llm_providers_used=providers_used,
             resumed=resumed,
+            coverage_gaps=coverage_gaps_payload,
+            stages_form=stages_form,
         )
 
     def _build_postgres_sink(self, *, logger: RuntimeLogger | None):

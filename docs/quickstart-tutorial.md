@@ -196,8 +196,9 @@ checkpoint semantics.
 - **Add coder verification.** Pair the per-path agents with a 4th
   agent that re-reads the whole repo for sibling-module evidence —
   see [Coder verification](coder.md).
-- **Enable teaming mode.** Run multiple subagents per stage with
-  validator debate rounds — see [Teaming mode](teaming.md).
+- **Switch to deep mode.** Set `audit.mode: deep` in `xauditor.yml`
+  to run multi-replica analyzer/validator stages with validator
+  debate — see [Audit modes](audit-modes.md).
 - **Tune throughput.** Raise `audit.worker_count` for parallel
   path execution — see [Audit parallelism](audit-parallelism.md).
 - **Self-host the full stack.** Single-VM compose deployment with

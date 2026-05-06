@@ -29,8 +29,8 @@ import { ModelSettingsSection } from "@/components/model-settings-section";
 import type { ProviderDraft } from "@/components/model-settings-section";
 import { RepositorySection } from "@/components/repository-section";
 import { SettingsToc } from "@/components/settings-toc";
-import { TeamingSection } from "@/components/teaming-section";
-import type { TeamingDraft } from "@/components/teaming-section";
+import { AuditModeSection } from "@/components/audit-mode-section";
+import type { AuditModeDraft } from "@/components/audit-mode-section";
 import {
   isReadOnly as configIsReadOnly,
   readOnlyCountForPrefix,
@@ -225,7 +225,7 @@ export default function SettingsPage() {
   const [auditDraft, setAuditDraft] = React.useState<string | undefined>(
     undefined,
   );
-  const [teamingDraft, setTeamingDraft] = React.useState<TeamingDraft>({});
+  const [auditModeDraft, setAuditModeDraft] = React.useState<AuditModeDraft>({});
   const [coderDraft, setCoderDraft] = React.useState<CoderDraft>({});
   const [note, setNote] = React.useState("");
   const [saveError, setSaveError] = React.useState<string | null>(null);
@@ -264,16 +264,17 @@ export default function SettingsPage() {
 
   const repositoryValue = repositoryDraft ?? rawList("repository.excludes");
 
-  function teamingProviderList(team: "analyzer" | "validator" | "exploiter"): string[] {
-    const draftValue = teamingDraft[team]?.provider_list;
+  function auditModeProviderList(team: "analyzer" | "validator" | "exploiter"): string[] {
+    const draftValue = auditModeDraft.provider_lists?.[team];
     if (draftValue !== undefined) return draftValue;
-    return rawList(`teaming.${team}.provider_list`);
+    return rawList(`audit.${team}.provider_list`);
   }
 
-  function teamingEnabledEffective(): boolean {
-    const draftEnabled = teamingDraft.enabled;
-    if (draftEnabled !== undefined) return draftEnabled === "true";
-    return Boolean(fields["teaming.enabled"]?.value);
+  function auditModeIsDeep(): boolean {
+    const draftMode = auditModeDraft.mode;
+    if (draftMode !== undefined) return draftMode === "deep";
+    const raw = fields["audit.mode"]?.value;
+    return raw === "deep";
   }
 
   function validateAllDrafts(): boolean {
@@ -338,11 +339,11 @@ export default function SettingsPage() {
         }
       }
     }
-    if (teamingEnabledEffective()) {
+    if (auditModeIsDeep()) {
       for (const team of ["analyzer", "validator", "exploiter"] as const) {
-        if (teamingProviderList(team).length === 0) {
-          errors[`teaming.${team}.provider_list`] =
-            "Required when teaming.enabled is true";
+        if (auditModeProviderList(team).length === 0) {
+          errors[`audit.${team}.provider_list`] =
+            "Required when audit.mode is deep";
         }
       }
     }
@@ -399,42 +400,81 @@ export default function SettingsPage() {
       }
     }
 
-    // Teaming.
+    // Audit mode (canonical new shape — `audit.mode` preset +
+    // `audit.replication.*` + `audit.validator.debate.*` +
+    // `audit.max_findings_per_unit`).
     if (
-      teamingDraft.enabled !== undefined &&
-      !isReadOnly("teaming.enabled")
+      auditModeDraft.mode !== undefined &&
+      auditModeDraft.mode !== "" &&
+      !isReadOnly("audit.mode")
     ) {
-      setNested(body, "teaming.enabled", teamingDraft.enabled === "true");
+      setNested(body, "audit.mode", auditModeDraft.mode);
     }
+    if (
+      auditModeDraft.max_findings_per_unit !== undefined &&
+      auditModeDraft.max_findings_per_unit !== "" &&
+      !isReadOnly("audit.max_findings_per_unit")
+    ) {
+      const n = Number(auditModeDraft.max_findings_per_unit);
+      if (Number.isFinite(n)) {
+        setNested(body, "audit.max_findings_per_unit", n);
+      }
+    }
+    for (const stage of ["analyzer", "validator", "exploiter"] as const) {
+      const replicationKey = `audit.replication.${stage}`;
+      const raw = auditModeDraft.replication?.[stage];
+      if (raw !== undefined && raw !== "" && !isReadOnly(replicationKey)) {
+        const n = Number(raw);
+        if (Number.isFinite(n)) {
+          setNested(body, replicationKey, n);
+        }
+      }
+    }
+    if (
+      auditModeDraft.validator_debate?.enabled !== undefined &&
+      !isReadOnly("audit.validator.debate.enabled")
+    ) {
+      setNested(
+        body,
+        "audit.validator.debate.enabled",
+        auditModeDraft.validator_debate.enabled === "true",
+      );
+    }
+    if (
+      auditModeDraft.validator_debate?.max_rounds !== undefined &&
+      auditModeDraft.validator_debate.max_rounds !== "" &&
+      !isReadOnly("audit.validator.debate.max_rounds")
+    ) {
+      const n = Number(auditModeDraft.validator_debate.max_rounds);
+      if (Number.isFinite(n)) {
+        setNested(body, "audit.validator.debate.max_rounds", n);
+      }
+    }
+    // `portal-coverage-panel`: Coverage Gaps reporting toggle.
+    if (
+      auditModeDraft.coverage_gaps_report !== undefined &&
+      auditModeDraft.coverage_gaps_report !== "" &&
+      !isReadOnly("audit.coverage_gaps.report")
+    ) {
+      setNested(
+        body,
+        "audit.coverage_gaps.report",
+        auditModeDraft.coverage_gaps_report === "true",
+      );
+    }
+    // Per-stage `provider_list` writes the canonical
+    // `audit.<stage>.provider_list` keys (Phase 1B,
+    // `migrate-provider-list-to-audit-namespace`). The legacy
+    // `teaming.<stage>.provider_list` keys still load via the
+    // migration shim for one minor release; new writes go to the
+    // canonical location.
     for (const team of ["analyzer", "validator", "exploiter"] as const) {
-      const teamDraft = teamingDraft[team];
-      if (!teamDraft) continue;
+      const providerList = auditModeDraft.provider_lists?.[team];
       if (
-        teamDraft.subagent_count !== undefined &&
-        teamDraft.subagent_count !== "" &&
-        !isReadOnly(`teaming.${team}.subagent_count`)
+        providerList !== undefined &&
+        !isReadOnly(`audit.${team}.provider_list`)
       ) {
-        const n = Number(teamDraft.subagent_count);
-        if (Number.isFinite(n)) {
-          setNested(body, `teaming.${team}.subagent_count`, n);
-        }
-      }
-      if (
-        teamDraft.provider_list !== undefined &&
-        !isReadOnly(`teaming.${team}.provider_list`)
-      ) {
-        setNested(body, `teaming.${team}.provider_list`, teamDraft.provider_list);
-      }
-      if (
-        team === "validator" &&
-        teamDraft.debate_rounds !== undefined &&
-        teamDraft.debate_rounds !== "" &&
-        !isReadOnly("teaming.validator.debate_rounds")
-      ) {
-        const n = Number(teamDraft.debate_rounds);
-        if (Number.isFinite(n)) {
-          setNested(body, "teaming.validator.debate_rounds", n);
-        }
+        setNested(body, `audit.${team}.provider_list`, providerList);
       }
     }
 
@@ -608,7 +648,7 @@ export default function SettingsPage() {
       setRepositoryDraft(undefined);
       setGraphBuildDraft({});
       setAuditDraft(undefined);
-      setTeamingDraft({});
+      setAuditModeDraft({});
       setCoderDraft({});
       setNote("");
       setSamplingErrors({});
@@ -660,7 +700,7 @@ export default function SettingsPage() {
     { id: "section-repository", label: "Repository", prefix: "repository." },
     { id: "section-graph-build", label: "Graph build", prefix: "graph.build." },
     { id: "section-audit", label: "Audit", prefix: "audit." },
-    { id: "section-teaming", label: "Teaming", prefix: "teaming." },
+    { id: "section-audit-mode", label: "Audit mode", prefix: "audit." },
     { id: "section-coder", label: "Coder", prefix: "coder." },
     {
       id: "section-llm-providers",
@@ -854,15 +894,20 @@ export default function SettingsPage() {
       </SectionShell>
 
       <SectionShell
-        id="section-teaming"
-        title="Teaming"
-        badgeCount={readOnlyCountForPrefix(fields, "teaming.")}
+        id="section-audit-mode"
+        title="Audit mode"
+        badgeCount={
+          readOnlyCountForPrefix(fields, "audit.") +
+          readOnlyCountForPrefix(fields, "teaming.")
+        }
       >
-        <TeamingSection
+        <AuditModeSection
           fields={fields}
           providerNames={providerNames}
-          draft={teamingDraft}
-          onChange={(patch) => setTeamingDraft((prev) => ({ ...prev, ...patch }))}
+          draft={auditModeDraft}
+          onChange={(patch: AuditModeDraft) =>
+            setAuditModeDraft((prev) => ({ ...prev, ...patch }))
+          }
         />
       </SectionShell>
 

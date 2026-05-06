@@ -108,11 +108,27 @@ class RunMeta:
     repo_root: str
     project_name: str
     build_fingerprint: str
-    mode: str  # "single" | "team"
+    mode: str  # "fast" | "deep" (post-Phase-1 rename); legacy "single"/"team" rewritten by alembic 0011
     run_label: str
     started_at: datetime
     llm_providers_used: dict[str, Any] = field(default_factory=dict)
     resumed: bool = False
+    # Stage-call form selected for this run (`audit.stages.form`).
+    # ``"prompt"`` routes each agent stage through LangChain providers;
+    # ``"agentic"`` routes through xauditor-coder-service's
+    # ``/agent_invocations`` endpoint. Persisted to the Postgres sink so
+    # operators can tell from the run row alone which form ran, without
+    # inferring from downstream artifacts (``agentic_transcript``,
+    # reconciliation rows). Default is the safe ``"prompt"`` for any
+    # caller that constructs ``RunMeta`` outside ``services._build_run_meta``
+    # (test fixtures, in-memory replays).
+    stages_form: str = "prompt"
+    # Phase 5A: per-run CoverageGaps payload (the JSONB shape) so
+    # sinks can persist it onto `audit_runs.coverage_gaps`
+    # alongside the existing per-run metadata. `None` when
+    # `audit.coverage_gaps.report` is false or for sinks that
+    # don't yet read this field.
+    coverage_gaps: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)

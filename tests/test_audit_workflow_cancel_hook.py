@@ -55,8 +55,8 @@ class _InterruptingAnalyzer:
     simulate the user pressing Ctrl+C at the very start of the
     audit, before any path can complete."""
 
-    def run(self, *, unit, path_functions, path_context=None):
-        del unit, path_functions, path_context
+    def run(self, *, unit, path_functions, path_context=None, excluded_findings=()):
+        del unit, path_functions, path_context, excluded_findings
         raise KeyboardInterrupt()
 
 
@@ -67,7 +67,7 @@ class _StubExploitation:
 
 
 class _StubValidator:
-    def run(self, *, unit, analyzer, exploitation, path_context=None):
+    def run(self, *, unit, analyzer, exploitation=None, path_context=None):
         del unit, analyzer, exploitation, path_context
         return ValidationResult(status=ValidationStatus.VALID, analysis="ok")
 

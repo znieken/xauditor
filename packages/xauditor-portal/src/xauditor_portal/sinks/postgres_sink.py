@@ -282,6 +282,13 @@ class PostgresReportSink:
                 project_name=meta.project_name,
                 build_fingerprint=meta.build_fingerprint,
                 mode=meta.mode,
+                # `getattr` shim: older xauditor releases (pre-0014 portal /
+                # pre-`portal-show-stages-form` xauditor) do not yet carry
+                # ``stages_form`` on ``RunMeta``. Defaulting to ``"prompt"``
+                # keeps the open_run path working when the audit-side and
+                # portal-side packages are version-skewed; the column
+                # default echoes the same value on the DB layer.
+                stages_form=getattr(meta, "stages_form", "prompt"),
                 status="in_progress",
                 progress_percent=0,
                 total_candidates=0,
@@ -302,6 +309,7 @@ class PostgresReportSink:
             existing.project_name = meta.project_name
             existing.build_fingerprint = meta.build_fingerprint
             existing.mode = meta.mode
+            existing.stages_form = getattr(meta, "stages_form", "prompt")
             existing.llm_providers_used = dict(meta.llm_providers_used)
             existing.started_at = meta.started_at
             resumed = bool(getattr(meta, "resumed", False))
@@ -449,6 +457,16 @@ class PostgresReportSink:
                 "exploitation_steps": _str(getattr(source, "exploitation_steps", "")),
                 "validation_status": _str(_coerce_enum_value(getattr(source, "validation_status", ""))),
                 "validation_analysis": _str(getattr(source, "validation_analysis", "")),
+                # `wire-agentic-into-workflow` Phase 3 — populate the
+                # alembic 0012 + 0013 JSONB columns. `getattr` with
+                # defaults keeps backwards compat with `Finding`
+                # instances constructed by code that predates this
+                # change (the columns land NULL).
+                "agentic_transcript": (
+                    list(getattr(source, "agentic_transcript", ()) or ())
+                    or None
+                ),
+                "reconciliation": getattr(source, "reconciliation", None),
             }
             if row is None:
                 row = FindingRow(run_id=run_row.id, **fields)
@@ -934,7 +952,7 @@ class PostgresReportSink:
             repo_root="",
             project_name="(orphan — open_run not called)",
             build_fingerprint=fingerprint or "unknown",
-            mode="single",
+            mode="fast",
             status="in_progress",
         )
         session.add(row)

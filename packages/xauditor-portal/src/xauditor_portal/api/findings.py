@@ -6,7 +6,7 @@ from datetime import datetime
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -77,6 +77,26 @@ class FindingDetail(FindingSummary):
     # extra round-trip.
     duplicate_of_finding_id: str | None = None
     duplicate_of: "DuplicateOfSummary | None" = None
+    reconciliation: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Per-finding reconciliation payload. Schema: "
+            "`{per_unit_verdicts: list[{unit_kind, unit_id, verdict, analysis}], "
+            "consolidated_verdict: str, consolidation_reasoning: str, "
+            "transcript?: list[{tool, input, output}]}`. NULL on path-only / "
+            "passthrough-reconciled findings; populated when the agentic "
+            "reconciler runs on multi-unit findings."
+        ),
+    )
+    agentic_transcript: list[dict[str, Any]] | None = Field(
+        default=None,
+        description=(
+            "Per-finding agentic tool-call transcript written by the "
+            "AgenticStageRunner when `audit.stages.form: agentic`. "
+            "JSON list of `{tool, input, output}` records. NULL on "
+            "prompt-form findings."
+        ),
+    )
 
 
 class FeedbackIn(BaseModel):
@@ -153,10 +173,10 @@ async def list_run_findings(
     session: AsyncSession = Depends(get_session),
     file: str | None = Query(default=None),
     function: str | None = Query(default=None),
-    confidence: str | None = Query(default=None),
-    validation_status: str | None = Query(default=None),
-    exploitation_status: str | None = Query(default=None),
-    feedback_label: str | None = Query(default=None),
+    confidence: list[str] | None = Query(default=None),
+    validation_status: list[str] | None = Query(default=None),
+    exploitation_status: list[str] | None = Query(default=None),
+    feedback_label: list[str] | None = Query(default=None),
     q: str | None = Query(default=None, description="Free-text substring search"),
     limit: int = Query(default=200, ge=1, le=1000),
     offset: int = Query(default=0, ge=0),
@@ -170,11 +190,11 @@ async def list_run_findings(
     if function:
         query = query.where(Finding.function_name.ilike(f"%{function}%"))
     if confidence:
-        query = query.where(Finding.confidence_level == confidence)
+        query = query.where(Finding.confidence_level.in_(confidence))
     if validation_status:
-        query = query.where(Finding.validation_status == validation_status)
+        query = query.where(Finding.validation_status.in_(validation_status))
     if exploitation_status:
-        query = query.where(Finding.exploitation_status == exploitation_status)
+        query = query.where(Finding.exploitation_status.in_(exploitation_status))
     if q:
         like = f"%{q}%"
         query = query.where(
@@ -238,7 +258,8 @@ async def list_run_findings(
         for f in findings
     ]
     if feedback_label:
-        items = [i for i in items if (i.feedback_label or "unlabeled") == feedback_label]
+        wanted = set(feedback_label)
+        items = [i for i in items if (i.feedback_label or "unlabeled") in wanted]
     return items
 
 
@@ -354,6 +375,8 @@ async def get_finding(
             }
             for e in coder_evidence_rows
         ],
+        reconciliation=finding.reconciliation,
+        agentic_transcript=finding.agentic_transcript,
     )
 
 

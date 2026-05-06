@@ -24,6 +24,7 @@ xauditor_report_store-?.?.?/
 node_modules/
 .next/
 out/
+*.tsbuildinfo
 
 # Self-hosted deployment (see deploy/README.md)
 deploy/.env
@@ -32,3 +33,4 @@ deploy/packages/*
 deploy/install/*.log
 mypy.log
 lint.log
+.claude

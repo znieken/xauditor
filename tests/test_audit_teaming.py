@@ -29,6 +29,9 @@ from xauditor.audit.agents import (
 )
 from xauditor.config import (
     AnalyzerTeamConfig,
+    AuditAnalyzerStageConfig,
+    AuditExploiterStageConfig,
+    AuditValidatorStageConfig,
     ExploiterTeamConfig,
     LLMConfig,
     LLMSettings,
@@ -37,6 +40,7 @@ from xauditor.config import (
     RepositoryConfig,
     RuntimeConfig,
     TeamingConfig,
+    ValidatorDebateConfig,
     ValidatorTeamConfig,
     XAuditorConfig,
 )
@@ -46,7 +50,7 @@ from xauditor.prompts import (
     DEDUP_JUDGE_PROMPT,
     EXPLOITATION_PROMPT,
     VALIDATOR_DEBATE_PROMPT,
-    VALIDATOR_TEAMING_PROMPT,
+    VALIDATOR_PROMPT,
 )
 
 
@@ -66,6 +70,38 @@ class FakeChatModel:
 
     def invoke_text(self, system: str, user: dict, *, user_text: str | None = None) -> str:
         return json.dumps(self.invoke_json(system, user, user_text=user_text))
+
+
+def _analyzer_kwargs(teaming: TeamingConfig) -> dict[str, Any]:
+    """Translate a legacy TeamingConfig into the new AnalyzerTeam kwargs."""
+    return {
+        "stage_cfg": AuditAnalyzerStageConfig(
+            provider_list=teaming.analyzer.provider_list
+        ),
+        "replication": teaming.analyzer.subagent_count,
+    }
+
+
+def _validator_kwargs(teaming: TeamingConfig) -> dict[str, Any]:
+    return {
+        "stage_cfg": AuditValidatorStageConfig(
+            provider_list=teaming.validator.provider_list,
+            debate=ValidatorDebateConfig(
+                enabled=True,
+                max_rounds=teaming.validator.debate_rounds,
+            ),
+        ),
+        "replication": teaming.validator.subagent_count,
+    }
+
+
+def _exploiter_kwargs(teaming: TeamingConfig) -> dict[str, Any]:
+    return {
+        "stage_cfg": AuditExploiterStageConfig(
+            provider_list=teaming.exploiter.provider_list
+        ),
+        "replication": teaming.exploiter.subagent_count,
+    }
 
 
 def _llm_settings(provider_names: tuple[str, ...]) -> LLMSettings:
@@ -146,7 +182,7 @@ class AnalyzerTeamTests(unittest.TestCase):
             return FakeChatModel(provider_name=provider_name, responder=responder)
 
         with patch("xauditor.audit.agents.build_chat_model", side_effect=fake_build):
-            team = AnalyzerTeam(teaming=teaming, llm=llm)
+            team = AnalyzerTeam(**_analyzer_kwargs(teaming), llm=llm)
             consolidated, records = team.run(
                 unit=_unit(), path_functions=[_function()], path_context=None
             )
@@ -186,7 +222,7 @@ class AnalyzerTeamTests(unittest.TestCase):
             return FakeChatModel(provider_name=provider_name, responder=responder)
 
         with patch("xauditor.audit.agents.build_chat_model", side_effect=fake_build):
-            team = AnalyzerTeam(teaming=teaming, llm=llm)
+            team = AnalyzerTeam(**_analyzer_kwargs(teaming), llm=llm)
             consolidated, records = team.run(
                 unit=_unit(), path_functions=[_function()], path_context=None
             )
@@ -219,7 +255,7 @@ class ValidatorTeamTests(unittest.TestCase):
 
         analyzer = AnalyzerResult(status="candidate", finding_name="X", evidence_strength="high")
         with patch("xauditor.audit.agents.build_chat_model", side_effect=fake_build):
-            team = ValidatorTeam(teaming=teaming, llm=llm)
+            team = ValidatorTeam(**_validator_kwargs(teaming), llm=llm)
             result, records, debate = team.run_for_finding(
                 unit=_unit(), analyzer=analyzer, path_context=None, finding_fingerprint="fp::f0"
             )
@@ -234,7 +270,7 @@ class ValidatorTeamTests(unittest.TestCase):
         call_state = {"rounds": 0}
 
         def responder(model, system, user):
-            if system == VALIDATOR_TEAMING_PROMPT:
+            if system == VALIDATOR_PROMPT:
                 # Return disagreement initially
                 if model.provider_name == "p1":
                     return {"status": "Valid", "analysis": "p1 says valid"}
@@ -252,7 +288,7 @@ class ValidatorTeamTests(unittest.TestCase):
 
         analyzer = AnalyzerResult(status="candidate", finding_name="X", evidence_strength="high")
         with patch("xauditor.audit.agents.build_chat_model", side_effect=fake_build):
-            team = ValidatorTeam(teaming=teaming, llm=llm)
+            team = ValidatorTeam(**_validator_kwargs(teaming), llm=llm)
             result, records, debate = team.run_for_finding(
                 unit=_unit(), analyzer=analyzer, path_context=None, finding_fingerprint="fp::f0"
             )
@@ -269,7 +305,7 @@ class ValidatorTeamTests(unittest.TestCase):
         llm = _llm_settings(("p1", "p2"))
 
         def responder(model, system, user):
-            if system == VALIDATOR_TEAMING_PROMPT:
+            if system == VALIDATOR_PROMPT:
                 return (
                     {"status": "Valid", "analysis": "p1"}
                     if model.provider_name == "p1"
@@ -288,7 +324,7 @@ class ValidatorTeamTests(unittest.TestCase):
 
         analyzer = AnalyzerResult(status="candidate", finding_name="X", evidence_strength="high")
         with patch("xauditor.audit.agents.build_chat_model", side_effect=fake_build):
-            team = ValidatorTeam(teaming=teaming, llm=llm)
+            team = ValidatorTeam(**_validator_kwargs(teaming), llm=llm)
             _result, _records, debate = team.run_for_finding(
                 unit=_unit(), analyzer=analyzer, path_context=None, finding_fingerprint="fp::f0"
             )
@@ -316,7 +352,7 @@ class ExploiterTeamTests(unittest.TestCase):
 
         analyzer = AnalyzerResult(status="candidate", finding_name="X", evidence_strength="high")
         with patch("xauditor.audit.agents.build_chat_model", side_effect=fake_build):
-            team = ExploiterTeam(teaming=teaming, llm=llm)
+            team = ExploiterTeam(**_exploiter_kwargs(teaming), llm=llm)
             result, records = team.run_for_finding(
                 unit=_unit(), analyzer=analyzer, path_context=None, validator_context={"validator_verdict": "Valid"}
             )

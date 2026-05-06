@@ -94,7 +94,14 @@ export function toQueryString(params: Record<string, unknown>): string {
   const search = new URLSearchParams();
   for (const [key, value] of Object.entries(params)) {
     if (value === undefined || value === null || value === "") continue;
-    search.set(key, String(value));
+    if (Array.isArray(value)) {
+      for (const v of value) {
+        if (v === undefined || v === null || v === "") continue;
+        search.append(key, String(v));
+      }
+    } else {
+      search.set(key, String(value));
+    }
   }
   const s = search.toString();
   return s ? `?${s}` : "";
@@ -120,7 +127,7 @@ export const api = {
     limit?: number;
     offset?: number;
     status?: RunStatus | string;
-    mode?: "single" | "team";
+    mode?: "fast" | "deep";
     project?: string;
   } = {}) => request<RunsPage>(`/api/runs${toQueryString(params)}`),
   getRun: (runId: string) => request<RunDetail>(`/api/runs/${runId}`),

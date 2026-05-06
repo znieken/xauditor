@@ -33,7 +33,6 @@ from xauditor.prompts import (
     PATH_SUMMARY_PROMPT,
     VALIDATOR_DEBATE_PROMPT,
     VALIDATOR_PROMPT,
-    VALIDATOR_TEAMING_PROMPT,
 )
 
 _THINK_BLOCK_RE = re.compile(r"<think>(.*?)</think>\s*", re.DOTALL | re.IGNORECASE)
@@ -242,7 +241,7 @@ def _mock_response(system: str, user: dict[str, Any]) -> dict[str, Any]:
             "status": "ready",
             "steps": "Supply attacker-controlled code or expressions to reach the dynamic execution sink.",
         }
-    if system == VALIDATOR_PROMPT or system == VALIDATOR_TEAMING_PROMPT:
+    if system == VALIDATOR_PROMPT:
         evidence_strength = str(user.get("evidence_strength", "low"))
         if evidence_strength == "high":
             status = "Valid"

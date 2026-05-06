@@ -3,6 +3,73 @@
 All notable changes to `xauditor-coder-service` are logged here. The
 xauditor CLI's own version lives in the repo-root `pyproject.toml`.
 
+## [1.1.0] - 2026-05-05
+
+### Added (`extend-coder-service-for-agent-invocations`)
+
+- **`POST /agent_invocations` endpoint** — synchronous,
+  generic claude invocation that returns the structured
+  `AgentInvocationResponse` body in the HTTP response (no
+  async job pattern, no idempotency keys). Reuses the
+  existing bearer-auth dependency, the existing
+  per-project workspace mount, and the existing
+  `asyncio.Semaphore(max_concurrent_jobs)` admission
+  control with `/verifications`. Designed for the
+  agentic stage runner (`audit.stages.form: agentic`) on
+  the xauditor side, but the endpoint itself is
+  use-case-agnostic.
+- **Request body** carries five fields:
+  `system_prompt` (min_length=1), `user_payload`
+  (arbitrary JSON), `response_schema` (JSON Schema for
+  structured-output validation), `timeout_seconds`
+  (bounded `[10, 1800]`), and optional `project`
+  (workspace routing, same rules as `/verifications`).
+  No tool-grant fields, no max-tool-call counts, no
+  budget caps — the coder-service container is the
+  security sandbox, and `timeout_seconds` is the only
+  enforceable per-call cost cap.
+- **Response body** carries `final_answer` (validated
+  against `response_schema`), `transcript` (per-tool
+  call list), `fell_back` (bool), `fallback_reason`
+  (str | None), and `elapsed_seconds`.
+- **CLI invocation** uses the real `claude` flags:
+  `claude -p --output-format json --json-schema <schema>
+  --append-system-prompt <prompt> --add-dir <project_dir>`
+  with the user payload piped via stdin.
+- **HTTP-vs-fallback semantics**: 4xx for malformed
+  requests / auth / unknown project; 5xx for
+  coder-service infra failure; 200 OK with
+  `fell_back: true` + `fallback_reason` for
+  claude-code-side failures (subprocess crash, timeout,
+  schema-violating output, malformed JSON, empty
+  stdout, invalid response_schema).
+- **Cancellation**: HTTP client disconnect → SIGTERM the
+  inner claude subprocess (mirrors
+  `DELETE /verifications/{id}` semantics for the
+  synchronous shape). Polled at 0.5s cadence via
+  `request.is_disconnected()`.
+- **New runtime dep**: `jsonschema>=4.20` for the
+  `response_schema` validation pass.
+
+### Tests
+
+- `test_agent_invocations_endpoint.py` — 13 tests
+  covering happy path / fallback responses / Pydantic
+  request validation / bearer auth / shared-semaphore
+  concurrency / `/health` shape preservation. Endpoint
+  tests bypass the orchestrator with a stubbed
+  `run_agent_invocation`.
+- `test_agent_invocation_orchestrator.py` — 13 tests
+  covering the orchestrator end-to-end with a stub
+  `claude` binary (small Python script): envelope
+  extraction (`result` key, top-level dict, transcript
+  via `messages` key), fallback paths
+  (subprocess_exit_N, empty_stdout, malformed_response,
+  schema_validation_failed, invalid_response_schema,
+  subprocess_spawn_failed), wall-clock timeout
+  enforcement, cancellation via cancel_event, real CLI
+  argv shape, stdin-piped payload.
+
 ## [1.0.0] - 2026-05-02
 
 ### Changed (`support-nested-coder-projects` follow-up #3)

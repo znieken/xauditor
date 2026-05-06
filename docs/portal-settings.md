@@ -51,10 +51,13 @@ also names the key.
 | Graph build | `graph.build.paths_max_count` | int | `≥ 1` |
 | Graph build | `graph.build.neo4j_chunk_size` | int | `[100, 50000]` |
 | Audit | `audit.worker_count` | int | `[1, 16]` |
-| Teaming | `teaming.enabled` | boolean | — |
-| Teaming | `teaming.<team>.subagent_count` | int | `≥ 1` |
-| Teaming | `teaming.<team>.provider_list` | list of provider names | required when enabled |
-| Teaming | `teaming.validator.debate_rounds` | int | `≥ 1` |
+| Audit mode | `audit.mode` | enum | `fast \| deep` |
+| Audit mode | `audit.max_findings_per_unit` | int | `[1, 20]` |
+| Audit mode | `audit.replication.<stage>` | int | `[1, 20]` |
+| Audit mode | `audit.validator.debate.enabled` | boolean | — |
+| Audit mode | `audit.validator.debate.max_rounds` | int | `[1, 20]` |
+| Audit mode | `audit.coverage_gaps.report` | boolean | default `true`; suppresses the Coverage Gaps section + portal panel when `false` |
+| Audit mode (legacy) | `teaming.<team>.provider_list` | list of provider names | required when `audit.mode` is `deep` |
 | Coder | `coder.enabled` | boolean | — |
 | Coder | `coder.transport` | enum | `subprocess \| http` |
 | Coder | `coder.cli_command` | list of tokens | — |
@@ -162,7 +165,7 @@ spot overrides without expanding every section.
 
 ## Multi-value fields
 
-`teaming.<team>.provider_list`, `repository.excludes`, and
+`teaming.<team>.provider_list` (legacy), `repository.excludes`, and
 `coder.cli_command` are rendered with a single shared `<ChipInput>`
 control that:
 

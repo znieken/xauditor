@@ -839,7 +839,10 @@ class GraphAuditReportingTests(unittest.TestCase):
             for message, details in logger.debug_messages
             if message in {"Analyzer agent call", "Exploitation agent call", "Validator agent call"}
         }
-        self.assertEqual(prompt_logs["Analyzer agent call"]["prompt_version"], "v3")
+        # Phase 1B bumped the analyzer prompt to v4 (added the
+        # `excluded_findings` clause). Exploitation + validator
+        # remain at v3.
+        self.assertEqual(prompt_logs["Analyzer agent call"]["prompt_version"], "v4")
         self.assertEqual(prompt_logs["Exploitation agent call"]["prompt_version"], "v3")
         self.assertEqual(prompt_logs["Validator agent call"]["prompt_version"], "v3")
         self.assertEqual(prompt_logs["Analyzer agent call"]["provider"], "audit-specialist")

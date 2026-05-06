@@ -172,18 +172,12 @@ class LivePortalSmokeTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         body = response.json()
         self.assertIn("valid_findings_breakdown", body)
-        self.assertIn("false_positives_breakdown", body)
-        for block in (
-            body["valid_findings_breakdown"],
-            body["false_positives_breakdown"],
-        ):
-            for field in (
-                "base",
-                "added_by_feedback",
-                "removed_by_feedback",
-                "net",
-            ):
-                self.assertIn(field, block)
+        for field in ("base", "added_by_feedback", "removed_by_feedback", "net"):
+            self.assertIn(field, body["valid_findings_breakdown"])
+        # ``false_positives`` is now a feedback-derived integer (no breakdown).
+        self.assertIn("false_positives", body)
+        self.assertIsInstance(body["false_positives"], int)
+        self.assertNotIn("false_positives_breakdown", body)
 
     # --- 8.4: effective LLM config reachable ----------------------------
 

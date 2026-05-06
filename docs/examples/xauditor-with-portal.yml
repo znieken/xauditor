@@ -1,0 +1,377 @@
+# Example xauditor.yml — comprehensive configuration covering portal,
+# coder verification, audit modes (fast/deep), stage form (prompt/agentic),
+# graph build, and provider variants.
+#
+# Every block is optional. Omit what you don't need; the defaults kick in.
+# For the full configuration reference see docs/configuration.md and
+# docs/providers.md.
+
+# ---------------------------------------------------------------------------
+# Runtime + repository scope
+# ---------------------------------------------------------------------------
+runtime:
+  root_dir: .xauditor
+
+repository:
+  excludes:
+    - .venv
+    - node_modules
+    - vendor
+
+logging:
+  level: info
+  # file: /tmp/xauditor.log  # uncomment to mirror logs to a file
+
+# ---------------------------------------------------------------------------
+# Graph database — local managed Neo4j container is the default. Set
+# `graph.db.remote.url` to point at an external Neo4j; xauditor will skip
+# container lifecycle management for that database.
+# ---------------------------------------------------------------------------
+graph:
+  db:
+    # image: neo4j:5-community               # default
+    # container_name: xauditor-neo4j         # default
+    # volume_name: xauditor-neo4j-data       # default
+    # username: neo4j                        # default
+    password: change-me                       # default `xauditor-password`
+    # bolt_port: 7687                        # default
+    # http_port: 7474                        # default
+    # database: neo4j                        # default
+    # ready_timeout_seconds: 60              # default, minimum 1
+    # network_name: xauditor-portal-net      # default — shared with portal
+    # remote:
+    #   url: neo4j+s://graph.example.com:7687
+    #   ssl_ca: /etc/ssl/neo4j-ca.pem
+    #   pool_size: 10
+  build:
+    enable_llm_enrichment: false              # default true
+    # max_file_bytes: 10000000               # skip files larger than this
+    # paths_max_depth: 40                    # path-enumeration recursion cap
+    # paths_max_count: 50000                 # path-enumeration count cap
+    # neo4j_chunk_size: 5000                 # default 5000, clamped [100, 50000]
+
+# ---------------------------------------------------------------------------
+# Report database (portal data mirror) — local managed PostgreSQL container
+# is default. Only the `remote` block can carry credentials — the UI cannot
+# edit them.
+# ---------------------------------------------------------------------------
+reportdb:
+  # image: postgres:16-alpine                # default
+  # container_name: xauditor-reportdb        # default
+  # volume_name: xauditor-reportdb-data      # default
+  # username: xauditor                       # default
+  # password: xauditor-password              # default
+  # port: 5432                               # default
+  # database: xauditor_reportdb              # default
+  # ready_timeout_seconds: 60                # default, minimum 1
+  # network_name: xauditor-portal-net        # default — shared with portal
+  # remote:
+  #   url: postgresql+asyncpg://auditor:pass@reportdb.example.com:5432/xauditor
+  #   ssl_ca: /etc/ssl/pg-ca.pem
+  #   pool_size: 10
+
+# ---------------------------------------------------------------------------
+# Portal runtime — two-container topology (FastAPI backend + Next.js
+# frontend) sharing a docker network with graphdb / reportdb.
+# ---------------------------------------------------------------------------
+portal:
+  network_name: xauditor-portal-net          # default
+  host_port: 8080                             # default
+  expose_backend_on_localhost: false          # flip true for local debugging
+  # ready_timeout_seconds: 60                # default, minimum 1
+  # backend:
+  #   container_name: xauditor-portal-backend
+  #   image: xauditor-portal-backend:local
+  # frontend:
+  #   container_name: xauditor-portal-frontend
+  #   image: xauditor-portal-frontend:local
+
+# ---------------------------------------------------------------------------
+# LLM providers — values here are authoritative. UI edits cannot set api_key.
+#
+# Each provider declares a wire protocol via `kind`:
+#   - `kind: openai` (default)  — OpenAI-compat REST (OpenAI, vLLM, Together,
+#                                  Ollama-compat, Anthropic OpenAI shim, etc.)
+#   - `kind: anthropic`         — native Anthropic API
+# ---------------------------------------------------------------------------
+llm:
+  default_provider: shared
+  providers:
+    # OpenAI-compatible (kind defaults to openai when omitted)
+    shared:
+      base_url: https://your-openai-compatible-endpoint/v1
+      api_key: your-api-key
+      model_name: your-default-model
+      temperature: 0
+      top_p: 1
+      # top_k: 40                       # routes via extra_body for vLLM-style endpoints
+      # repetition_penalty: 1.05        # routes via extra_body; ignored by api.openai.com
+      # request_timeout_seconds: 1800   # SDK default ~600s; raise for thinking_effort: max
+      # thinking_enabled: false         # legacy; prefer thinking_effort on Anthropic kind
+
+    # Specialised OpenAI-compatible provider with extended thinking
+    graph_specialist:
+      base_url: https://your-openai-compatible-endpoint/v1
+      api_key: your-graph-api-key
+      model_name: your-graph-model
+      thinking_enabled: true
+
+    # Native Anthropic API (commented; uncomment if you use api.anthropic.com)
+    # anthropic_native:
+    #   kind: anthropic
+    #   base_url: https://api.anthropic.com   # NOTE: no trailing /v1
+    #   api_key: sk-ant-...
+    #   model_name: claude-sonnet-4-7
+    #   thinking_effort: high                 # low | medium | high | xhigh | max
+    #   request_timeout_seconds: 1800
+    #   temperature: 0
+    #   top_k: 64
+    #   top_p: 0.95
+
+# ---------------------------------------------------------------------------
+# Per-agent LLM overrides — pick a different provider and/or sampling per
+# agent role. `provider` references one of the keys under `llm.providers`.
+# Sampling fields overlay the provider's values; `request_timeout_seconds`
+# overlays the provider's per-call timeout.
+# ---------------------------------------------------------------------------
+agents:
+  graph_builder:
+    llm:
+      provider: graph_specialist
+  auditor:
+    llm:
+      provider: shared
+      # temperature: 0.4                # per-agent sampling override
+      # top_p: 0.95
+      # top_k: 40
+      # repetition_penalty: 1.05
+      # request_timeout_seconds: 900    # per-agent timeout override
+  validator:
+    llm:
+      provider: shared
+      # temperature: 0                  # deterministic validator example
+  exploitation:
+    llm:
+      provider: shared
+
+# ---------------------------------------------------------------------------
+# Audit pipeline — mode preset, worker pool, cancellation budget, sink
+# labelling, agentic stage form. See docs/configuration.md "Audit pipeline
+# shape" and docs/audit-modes.md for the prose.
+# ---------------------------------------------------------------------------
+audit:
+  # Mode preset (`fast` | `deep`). Operators MAY override any per-axis field
+  # below; workflow code reads the resolved values, not `mode` itself.
+  #
+  # Preset table:
+  #   fast: replication (1, 1, 1); debate disabled; iterative analyzer loop
+  #         capped at `max_findings_per_unit` (default 3).
+  #   deep: replication (3, 3, 1); debate enabled, max_rounds 2,
+  #         halt_on_consensus true; per-unit ceiling is implicitly
+  #         `replication.analyzer` (replicate-then-dedup, no iterative loop).
+  mode: fast                                   # `fast` | `deep`. Default fast.
+
+  # Concurrency. `worker_count: 1` (default) runs paths sequentially on
+  # master's thread (InlineExecutor). `>= 2` uses LocalSubprocessPool with
+  # crash isolation. Range [1, 16].
+  worker_count: 1
+  shutdown_timeout_seconds: 30                 # default 30, range [1, 600]
+  coder:
+    shutdown_timeout_seconds: 20               # default 20, must be < audit.shutdown_timeout_seconds
+
+  # Caps the per-unit iterative analyzer loop in **fast mode** only.
+  # Range [1, 20]; default 3. In deep mode the field is parsed but not
+  # consumed by the workflow — the per-unit ceiling is implicitly
+  # `replication.analyzer` (one replica → at most one surviving finding
+  # before dedup). Setting it under `mode: deep` is harmless but inert;
+  # raise `replication.analyzer` instead to widen deep-mode coverage.
+  max_findings_per_unit: 3
+
+  # Per-stage subagent replica count. Each replica gets a distinct persona
+  # in deep mode and runs in parallel. Range [1, 20] per stage.
+  # Preset defaults: fast = (1, 1, 1); deep = (3, 3, 1).
+  replication:
+    analyzer: 1                                 # deep preset: 3
+    validator: 1                                # deep preset: 3
+    exploiter: 1                                # deep preset: 1
+
+  # Multi-round validator debate (only meaningful when replication.validator > 1).
+  # `halt_on_consensus` short-circuits the debate when all replicas already agree.
+  # When `max_rounds` is reached without convergence, xauditor persists
+  # `validation_status = Inconclusive` rather than forcing a tiebreaker.
+  # Preset defaults: fast = disabled; deep = enabled, max_rounds 2.
+  validator:
+    debate:
+      enabled: false                            # deep preset: true
+      max_rounds: 5                             # deep preset: 2; range [1, 20]
+      halt_on_consensus: true
+    # Per-stage provider rotation (deep mode only — see Multi-model
+    # truth table above audit.stages.form). `validator.provider_list`
+    # is honoured regardless of stages.form because ValidatorTeam
+    # always runs prompt-form. Each name must match a key under
+    # `llm.providers`.
+    provider_list: []                           # e.g. [shared, graph_specialist]
+
+  # `audit.analyzer` / `audit.exploiter` mirror the validator block
+  # above for the analyzer and exploiter stages — empty by default.
+  # Under `stages.form: agentic` these provider_list values are
+  # silently ignored (single coder-service container = single model).
+  analyzer:
+    provider_list: []                           # e.g. [shared, graph_specialist]
+  exploiter:
+    provider_list: []                           # e.g. [shared]
+
+  # Stage-call form. `prompt` (default) routes through LangChain providers.
+  # `agentic` routes through the xauditor-coder-service `/agent_invocations`
+  # endpoint, which runs claude-code in a containerized workspace.
+  #
+  # Multi-model rotation per replica (see docs/audit-modes.md
+  # "Multi-model / multi-provider rotation per stage × form"):
+  #
+  #   stage      form     per-replica multi-model?  diversity from
+  #   --------   -------  ------------------------  ------------------
+  #   analyzer   prompt    yes — `provider_list`    provider × persona
+  #   analyzer   agentic   NO  — single container   persona only
+  #   validator  (any)     yes — always prompt-form provider × debate
+  #   exploiter  prompt    yes — `provider_list`    provider × persona
+  #   exploiter  agentic   NO  — single container   persona only
+  #
+  # Why validator is "(any)": ValidatorTeam never dispatches through
+  # the agentic runner — its multi-round debate is turn-by-turn and
+  # doesn't fit `/agent_invocations`'s one-shot dispatch. So validator
+  # always honours `validator.provider_list` regardless of stages.form.
+  #
+  # Why analyzer/exploiter lose multi-model under agentic: the
+  # `xauditor-coder-service` container is bound at `docker run` time
+  # to one (ANTHROPIC_BASE_URL, ANTHROPIC_MODEL, ANTHROPIC_API_KEY)
+  # triple. Every replica targets the same endpoint, so per-replica
+  # provider rotation has nowhere to land. Replica diversity is
+  # persona-only (`extra_system_prefix`).
+  stages:
+    form: prompt                                # `prompt` | `agentic`
+
+  # Agentic transport — only consulted when `stages.form: agentic`.
+  agentic:
+    timeout_seconds: 300                        # default 300, range [10, 1800]
+    transport:
+      kind: coder_service                       # only `coder_service` accepted today
+      coder_service:
+        endpoint: http://127.0.0.1:8090         # or unix:///path/to/sock
+        # bearer_token_env: XAUDITOR_AGENTIC_BEARER_TOKEN  # name of env var holding the token
+        request_timeout_safety_seconds: 60      # default 60, range [0, 600]
+        # project: ""                            # leave empty — auto-derived from
+                                                #   coder.workspace_root + repo_root.
+                                                #   Set only when the coder-service
+                                                #   workspace layout diverges from
+                                                #   the audit host's directory layout.
+
+  # Broadens the GraphSlice payload sent to analyzer/validator with
+  # type_context, cross_path_definitions, decorator_chain,
+  # registration_context, and entry_classification. Default true; set
+  # false only to roll back to the legacy three-field payload.
+  graph_slice: true
+
+  # Phase-rollout flags — see docs/audit-units.md, docs/audit-modes.md.
+  experimental:
+    units: false                                # planner emits sink/entry/state/boundary units
+
+  coverage_gaps:
+    report: true                                # write coverage_gaps.json next to findings.json
+
+  # Sink labelling — controls which FQNs are eligible as taint-sinks during
+  # SinkAuditUnit enumeration. `well_known` is an optional allow-list
+  # (empty = use the full default sink table); `custom` adds operator-defined
+  # FQNs not in the default table. See docs/configuration.md "Sink labelling".
+  sinks:
+    well_known: []
+    custom: []
+    #   - mypkg.unsafe_eval
+    #   - mypkg.shell_passthrough
+
+  # Deep-mode persona seeding — operator-supplied per-persona prompt
+  # overlays for analyzer/validator replicas. Empty list (default) uses
+  # DEFAULT_DEEP_PERSONAS. Each persona is a mapping with a required
+  # `name` and optional `focus_summary`, `extra_system_prefix`,
+  # `tool_emphasis` (list[str]).
+  personas: []
+  # personas:
+  #   - name: input-validation
+  #     focus_summary: Concentrate on input-handling boundaries.
+  #     extra_system_prefix: |
+  #       You are auditing the input-validation layer specifically.
+  #     tool_emphasis: [grep, read]
+
+# ---------------------------------------------------------------------------
+# Legacy teaming.* block — fully superseded by `audit.mode` +
+# `audit.replication.*` + `audit.validator.debate.*` + the per-stage
+# `audit.<stage>.provider_list` blocks above. The parser still loads
+# any populated `teaming.*` keys with a `DeprecationWarning` per key
+# for one minor release; the next minor release deletes the block
+# entirely.
+#
+# If you have a yaml using the legacy shape, replace it as follows:
+#   teaming.enabled: true              -> audit.mode: deep
+#   teaming.<stage>.subagent_count: N  -> audit.replication.<stage>: N
+#   teaming.<stage>.provider_list: [..]-> audit.<stage>.provider_list: [..]
+#   teaming.validator.debate_rounds: N -> audit.validator.debate.max_rounds: N
+#                                          (also implies enabled: true)
+# ---------------------------------------------------------------------------
+# teaming:                                    # ← deprecated, do not use in new configs
+#   enabled: true
+#   analyzer:
+#     subagent_count: 3
+#     provider_list: [claude_opus, claude_sonnet, gpt5]
+#   validator:
+#     subagent_count: 3
+#     provider_list: [claude_opus, gpt5]
+#     debate_rounds: 2
+#   exploiter:
+#     subagent_count: 1
+#     provider_list: [shared]
+
+# ---------------------------------------------------------------------------
+# Coder verification — optional 4th agent (Claude Code) that re-reads the
+# whole repo against each finding produced by the upstream pipeline.
+#
+# Two transports:
+#   - `subprocess` (default) — spawn `claude` directly on the host
+#   - `http`                  — long-lived containerised microservice
+#
+# Multi-project workspace (0.11.0+): set `coder.workspace_root` to a host
+# directory whose subdirectories at any depth ARE audit-able projects.
+# xauditor derives the project name as `repo_root` relative to
+# `workspace_root` (e.g. workspace=/home/user/ws + repo_root=/home/user/ws/team/repo
+# → project=team/repo). Falls back to basename(realpath(repo_root)) when
+# repo_root is outside workspace_root. Override via `coder.project_name`
+# only for genuine edge cases (worktrees pointing outside the workspace).
+# ---------------------------------------------------------------------------
+coder:
+  enabled: false                                # default false; flip to true to enable
+  transport: subprocess                         # `subprocess` | `http`
+  # cli_command: [claude]                       # default; tuple of argv tokens
+  concurrency: 4                                # default 2; max parallel verifications
+  thinking_effort: high                         # low | medium | high | xhigh | max
+  request_timeout_seconds: 1800                 # default 1800
+
+  # Model knobs translate to ANTHROPIC_* env vars baked into the worker.
+  # NOTE: `model_url` points at the host, not /v1 — claude SDK appends
+  # /v1/messages itself. Setting "https://example/v1" produces 404s.
+  model_url: https://api.anthropic.com
+  model_name: claude-sonnet-4-7
+  model_api_key: sk-ant-...
+  # working_directory: /workdir                 # CLI cwd override (subprocess transport)
+
+  # HTTP-transport-only knobs (uncomment when transport: http)
+  # endpoint: https://coder-pool.internal/      # default: unix://<runtime.root_dir>/coder.sock
+  # enable_auth: true
+  # endpoint_token: sk-coder-...
+  # poll_interval_seconds: 1.0
+  # preflight_timeout_seconds: 5
+
+  # Container-runtime knobs (only meaningful under HTTP transport against a
+  # local endpoint — i.e. the `xauditor coder {init,build,start,...}` lifecycle).
+  # container_image: xauditor-coder-service:local
+  # container_name: xauditor-coder-service
+  # runtime_socket_path: /var/run/xauditor-coder.sock
+  # workspace_root: /home/user/coder-workspace  # host dir whose subdirs are projects
+  # project_name: secmind                       # default = relpath(repo_root, workspace_root)

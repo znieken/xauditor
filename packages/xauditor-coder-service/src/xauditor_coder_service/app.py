@@ -1,14 +1,18 @@
 """FastAPI application factory for the coder microservice.
 
-The five routes are described by the spec ``coder-http-microservice``:
+The six routes are described by the spec ``coder-http-microservice``:
 
   POST   /verifications        — submit; returns 201 (or 200 on idempotent hit)
   GET    /verifications/{id}   — poll; returns the wire-shape JobState
   DELETE /verifications/{id}   — cancel; SIGTERM/SIGKILL the inner subprocess
+  POST   /agent_invocations    — synchronous; returns the structured
+                                 AgentInvocationResponse body when claude
+                                 finishes (or the wall-clock timer fires)
   GET    /projects             — list direct child subdirs of /workspace
   GET    /health               — unauth liveness probe
 
-Concurrency is bounded by ``asyncio.Semaphore(max_concurrent_jobs)``;
+Concurrency is bounded by ``asyncio.Semaphore(max_concurrent_jobs)``
+shared across BOTH ``/verifications`` and ``/agent_invocations``;
 queueing happens here, not on the xauditor side.
 """
 
@@ -24,11 +28,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 
 from xauditor_coder_service._vendored import walk_projects
+from xauditor_coder_service.agent_invocation import (
+    AgentInvocationConfig,
+    AgentInvocationRequest,
+    AgentInvocationResponse,
+    run_agent_invocation,
+)
 from xauditor_coder_service.auth import (
     AuthSettings,
     load_auth_settings,
@@ -292,6 +302,7 @@ def create_app(
     semaphore = asyncio.Semaphore(settings.max_concurrent_jobs)
     auth_dep = make_auth_dependency(settings.auth)
     worker_cfg = WorkerConfig(cli_path=settings.cli_path)
+    agent_inv_cfg = AgentInvocationConfig(cli_path=settings.cli_path)
 
     @asynccontextmanager
     async def _lifespan(app: FastAPI):  # noqa: D401
@@ -381,6 +392,64 @@ def create_app(
             )
         return job.to_response_dict()
 
+    # ----- /agent_invocations -------------------------------------------
+
+    @app.post(
+        "/agent_invocations",
+        dependencies=[Depends(auth_dep)],
+        response_model=AgentInvocationResponse,
+    )
+    async def agent_invoke(
+        body: AgentInvocationRequest, request: Request
+    ) -> AgentInvocationResponse:
+        # Project validation BEFORE worker-pool admission so a malformed
+        # name is rejected without consuming a slot. Empty / None
+        # `project` routes to the legacy single-repo container —
+        # `_validate_project_or_raise` returns "" and the orchestrator
+        # spawns claude in `/workspace` (or inherited cwd) directly.
+        project_dir = _validate_project_or_raise(body.project or "")
+
+        # Per-project HOME isolates claude session state across concurrent
+        # invocations targeting different projects. Empty project gets
+        # the shared default HOME (matches worker.py's behaviour).
+        home_path: str | None = None
+        if body.project:
+            home_path = str(_HOME_ROOT / body.project)
+            try:
+                Path(home_path).mkdir(mode=0o700, parents=True, exist_ok=True)
+            except OSError as exc:
+                log.warning(
+                    "Failed to mkdir per-project HOME %s: %s. "
+                    "Falling back to shared /home/coder.",
+                    home_path,
+                    exc,
+                )
+                home_path = None
+
+        # Cancellation: client disconnect → set the cancel event so the
+        # orchestrator SIGTERMs the inner subprocess. Mirrors
+        # `DELETE /verifications/{id}` semantics for the synchronous
+        # shape.
+        cancel_event = asyncio.Event()
+        watcher = asyncio.create_task(
+            _watch_disconnect(request, cancel_event)
+        )
+        try:
+            async with semaphore:
+                return await run_agent_invocation(
+                    body,
+                    config=agent_inv_cfg,
+                    project_dir=project_dir,
+                    home=home_path,
+                    cancel_event=cancel_event,
+                )
+        finally:
+            watcher.cancel()
+            try:
+                await watcher
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+
     @app.delete(
         "/verifications/{job_id}",
         dependencies=[Depends(auth_dep)],
@@ -463,6 +532,25 @@ async def _run_with_semaphore(
             cwd=cwd_path,
             home=home_path,
         )
+
+
+async def _watch_disconnect(request: Request, cancel_event: asyncio.Event) -> None:
+    """Poll ``request.is_disconnected()`` and set ``cancel_event`` on close.
+
+    FastAPI doesn't push disconnect notifications; the standard pattern
+    is to poll. 0.5s cadence balances responsiveness against overhead.
+    """
+
+    try:
+        while not cancel_event.is_set():
+            if await request.is_disconnected():
+                cancel_event.set()
+                return
+            await asyncio.sleep(0.5)
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 - watcher must not propagate
+        pass
 
 
 async def _reaper_loop(job_store: JobStore) -> None:

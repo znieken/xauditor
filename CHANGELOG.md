@@ -6,6 +6,703 @@ All notable changes to `xauditor` are logged here. The portal package
 package (`xauditor-coder-service`) tracks its own version inside
 `packages/xauditor-coder-service/pyproject.toml`.
 
+## [Unreleased]
+
+`migrate-provider-list-to-audit-namespace` (Phase 1B of
+`restructure-audit-modes-and-coverage`): per-stage provider rotation
+moves from the legacy `teaming.<stage>.provider_list` location to the
+canonical `audit.<stage>.provider_list` namespace. Highlights:
+
+- **New canonical paths**: `audit.analyzer.provider_list`,
+  `audit.validator.provider_list`, `audit.exploiter.provider_list`.
+  Each accepts a list of provider names defined under `llm.providers`.
+- **New env vars**: `XAUDITOR_AUDIT_{ANALYZER,VALIDATOR,EXPLOITER}_PROVIDER_LIST`
+  (comma-separated). The legacy `XAUDITOR_TEAMING_*_PROVIDER_LIST`
+  vars continue to work for one minor release with a per-var
+  `DeprecationWarning`.
+- **Workflow rewrite**: `audit/workflow.py` and `audit/agents.py`
+  now read every per-stage knob (replication count + provider list
+  + debate config) from `config.audit_mode.*` directly. The 10
+  legacy reads of `config.teaming.*` are gone. The
+  `AnalyzerTeam` / `ValidatorTeam` / `ExploiterTeam` constructor
+  signatures changed: replace `teaming=<TeamingConfig>` with
+  `stage_cfg=<AuditAnalyzerStageConfig|...>` + `replication=<int>`.
+- **AuditModeConfig shape**: the previously-flat `validator_debate`
+  field is replaced by `validator: AuditValidatorStageConfig`
+  carrying both `.debate` and `.provider_list`. The yaml shape
+  (`audit.validator.debate.*`) is unchanged.
+- **Migration shim** (`_migrate_legacy_teaming`): legacy
+  `teaming.<stage>.provider_list` keys are lifted into
+  `audit.<stage>.provider_list` with one `DeprecationWarning` per
+  populated key. New shape wins on collision; no warning fires
+  during deliberate dual-write.
+- **Heads-up for hand-edited yamls**: if you have set BOTH
+  `audit.replication.<stage>` AND `teaming.<stage>.subagent_count`
+  in the same file with different values, the workflow now uses
+  the `audit.replication.<stage>` value. Previously the workflow
+  was reading from the legacy `teaming.<stage>.subagent_count` path,
+  so this can change replica counts without further config edits.
+  Reconcile manually before upgrading.
+- **Deletion target**: the next minor release after this one will
+  delete the `teaming.*` block, the `TeamingConfig` dataclass, and
+  the `XAUDITOR_TEAMING_*` env vars entirely.
+
+Doc updates: `docs/audit-modes.md` (migration table + multi-model
+rotation table), `docs/agentic-stage-runner.md`,
+`docs/configuration.md` (env-var table), and
+`docs/examples/xauditor-with-portal.yml` all rewritten to present
+the new shape as canonical.
+
+The portal Settings page Audit-mode panel still labels provider
+rotation under "Advanced overrides → Provider rotation (legacy)";
+the rebind to the new dot-paths ships in a follow-up portal
+change.
+
+## [1.4.0] - 2026-05-05
+
+`capture-decorators-and-registrations`: graph build now
+captures decorator chains, framework registrations, sink
+labels, and self-mutation flags so the audit planner can
+emit five additional audit-unit kinds (sink / entry / state
+/ boundary, plus the existing path). The
+`audit.experimental.units` flag (default `false`) gates
+emission — operators opt into the broader unit-kind taxonomy
+without changing path-only baseline behaviour. The
+GraphSlice fields `decorator_chain` and
+`registration_context` flip from "reserved for a follow-up"
+to "populated when `audit.experimental.graph_slice: true`",
+so analyzer prompts can read decorator + registration
+context without per-stage extra calls.
+
+### Added
+
+- **Decorator capture (Python)** —
+  `PythonParser._extract_decorators` walks
+  `decorator_list` in reverse so position 0 = closest to
+  the function (applied first). Each decorator becomes a
+  `(:Decorator)` graph node with `framework` + `intent`
+  derived from `framework_heuristics.classify_decorator`'s
+  substring rule table. The `(:Function)-[:HAS_DECORATOR
+  {position}]->(:Decorator)` edge preserves chain order.
+  Idempotent MERGE keys derived from `(file_path,
+  line_number, expression)` via SHA1. See
+  [Framework heuristics](docs/framework-heuristics.md) for
+  the rule table; cross-language decorator capture is on
+  the same `_ParsedDecorator` plumbing — non-Python
+  parsers emit empty tuples until they grow per-language
+  extraction.
+- **Registration walker (Python)** —
+  `PythonParser._extract_registrations` recognises Flask
+  `app.add_url_rule(url, view)` (two- and three-arg
+  forms), Django `path(url, view)` and `re_path(...)`,
+  and Starlette `app.add_event_handler(event, handler)`.
+  Each registration site becomes a
+  `(:RegistrationSite)` node with `framework` + `intent`,
+  joined to its target Function via a
+  `(:RegistrationSite)-[:REGISTERS]->(:Function)` edge.
+  Resolver prefers same-file matches when callable_name
+  is ambiguous; lambdas + dynamic callables are dropped
+  cleanly (no resolvable name → no edge).
+- **Sink labelling (cross-language)** —
+  `graph/sink_labelling.py` ships a default table of ~80
+  FQNs across Python (heaviest), Go, Java,
+  JavaScript/TypeScript, Rust, C/C++ mapping each to one
+  of seven `sink_kind` values (`subprocess`, `command`,
+  `deserializer`, `http_client`, `sql`, `filesystem`,
+  `rendering`). `canonical.py`'s
+  `_synthesize_sink_stubs(...)` creates stub
+  `FunctionRecord` instances (`is_external=True,
+  is_well_known_sink=True, sink_kind=<kind>`) for every
+  external sink called from the audit target so
+  `SinkAuditUnit` enumeration can anchor on a real
+  Function-node identity. Operators tune the set via
+  `audit.sinks.well_known` (allow-list pruning) and
+  `audit.sinks.custom` (additive). See
+  [Sink labels](docs/sink-labels.md).
+- **Self-mutation detection (Python)** —
+  `PythonParser._detect_self_mutation` walks method
+  bodies for `Assign` / `AugAssign` / `AnnAssign` whose
+  target is `Attribute(value=Name('self'))`, with manual
+  recursion that prunes nested function/class scopes so
+  closure captures don't leak into the outer method. The
+  resulting `FunctionRecord.mutates_self` flag persists
+  on `:Function` nodes and feeds `StateAuditUnit`
+  emission.
+- **Five additional audit-unit kinds** —
+  `enumerate_units(source, audit_mode)` in
+  `audit/planner.py` now emits, when
+  `audit.experimental.units: true`:
+  - `SinkAuditUnit` per sink-labelled Function with all
+    inbound paths.
+  - `EntryAuditUnit` per function whose decorator chain
+    has `intent ∈ {route, task_handler, cli_entry}` OR
+    has an inbound REGISTERS edge.
+  - `StateAuditUnit` per Class with `>= 2` methods
+    having `mutates_self: true`.
+  - `BoundaryAuditUnit` per call site where the consumer
+    has `sink_kind ∈ {http_client, subprocess}`,
+    de-duplicated by `(producer, consumer)` pair across
+    paths sharing the same call. Producer = function
+    preceding the sink in the path's chain.
+  - `ConfigAuditUnit` deferred — see
+    [`capture-decorators-and-registrations` 2.2.6](openspec/changes/capture-decorators-and-registrations/tasks.md).
+  See [Audit units](docs/audit-units.md).
+- **GraphSlice v2 fields populated** —
+  `decorator_chain` and `registration_context` no longer
+  emit empty tuples when the v2 flag is on; the slice
+  joins per-function decorators + registrations onto the
+  path's functions at audit time. See the GraphSlice
+  section of [Audit modes](docs/audit-modes.md).
+- **Config**: `audit.sinks.{well_known,custom}` (with
+  `XAUDITOR_AUDIT_SINKS_*` env-var binding) for operator
+  override of the default sink table.
+
+### Notes
+
+- **Graph schema**: new `:Decorator`, `:RegistrationSite`
+  nodes; new `HAS_DECORATOR`, `REGISTERS` relationships;
+  new `Function.{is_external, is_well_known_sink,
+  sink_kind, mutates_self}` properties (default false /
+  empty for graphs built before this version).
+  `xauditor graph build` regenerates the new shape on
+  next run; no migration verb needed since MERGE keys
+  are deterministic.
+- **Workflow integration deferred**: the planner emits
+  the new unit kinds, but the per-stage prompt selection
+  (`PromptStageRunner.run_*` picking
+  `analyzer_sink` / `analyzer_entry` etc. by
+  `unit_kind`) and the workflow loop's switch from
+  `plan_audit_paths` to `enumerate_units` are tracked
+  separately as 2.3.1 + 2.4.1 + 2.4.2 — those land in a
+  follow-up. Today the new unit kinds emit but the
+  workflow loop continues to consume `PathAuditUnit`
+  only; flipping the flag is safe (no behaviour
+  regression) but doesn't yet route audits through the
+  new prompts.
+- **Cross-language scope**: decorator + registration
+  capture is Python-only today; the cross-language
+  parser plumbing is in place for non-Python parsers to
+  opt in by populating their own `_ParsedFunction`
+  decorators / `_ParsedFile` registrations. Sink
+  labelling already covers Go, Java, JavaScript /
+  TypeScript, Rust, C/C++ at the FQN level via the
+  default table. Self-mutation detection is Python-only
+  with the same plumbing pattern.
+
+## [1.3.0] - 2026-05-05
+
+`wire-agentic-into-workflow` Phases 0-1 + Phase 2 (analyzer
++ exploiter only) + Phase 3: the agentic stage stack
+(transport + runner + reconciler + alembic columns shipped
+in 1.2.0) is now actually called by the workflow. After
+this release, `audit.stages.form: agentic` flips fast-mode
+end-to-end (every per-stage call goes through coder-service's
+new `/agent_invocations` endpoint) AND deep-mode's analyzer
++ exploiter teams (per-replica calls go through the same
+transport with persona-distinct system prompts). Validator
+stays prompt-form for now — the multi-round debate
+machinery doesn't fit one-shot agentic dispatch and
+re-platforming it is a follow-up.
+
+### Added
+
+- **`CoderServiceAgentTransport`** — HTTP POST to
+  xauditor-coder-service's new `/agent_invocations`
+  endpoint (shipped in
+  `extend-coder-service-for-agent-invocations`,
+  coder-service 1.1.0+). Production transport for
+  `audit.stages.form: agentic`. Lazy `GET /health`
+  startup probe fails fast with the offending config
+  field name + endpoint URL when coder-service is
+  unreachable. Bearer auth via env-var pointer. Unix-
+  socket endpoints work the same way as the existing
+  `HttpCoderTransport` (Coder verifications).
+- **Workflow plumbing**: `AuditWorkflow.__init__` gains
+  three optional kwargs — `stage_runner` /
+  `reconciler` / `agent_transport`. `from_config`
+  builds the canonical `(stage_runner, transport)` pair
+  via `build_stage_runner(...)` and forwards transport
+  to `build_reconciler(...)` so both share one
+  underlying transport instance under `stages.form:
+  agentic`.
+- **Single-mode workflow re-platform**:
+  `_process_unit_single` flips its three direct agent
+  calls to `self.stage_runner.run_analyzer/validator/
+  exploiter(...)`. Default `stages.form: prompt` keeps
+  PromptStageRunner wrapping the same underlying agents
+  the workflow used to call directly — behaviour is
+  bit-for-bit identical.
+- **Transcript persistence**: `Finding` dataclass gains
+  `agentic_transcript: tuple[dict, ...] = ()`. The
+  workflow drains per-unit transcripts from the stage
+  runner via the new `pop_transcripts_for(unit_id)`
+  Protocol method after each per-unit chain completes;
+  `_build_finding` attaches them; the Postgres sink
+  writes the alembic-0013 column. Empty tuple under
+  prompt mode (PromptStageRunner's
+  `pop_transcripts_for(...)` is a no-op).
+- **Reconciler step at run end**: `Finding` dataclass
+  gains `reconciliation: dict | None = None`. The
+  workflow calls `self.reconciler.reconcile(findings)`
+  once after every per-unit chain has completed, then
+  stamps each finding with the reconciler's
+  `to_payload()` dict and re-emits
+  `on_finding_upsert(finding)` so the sink writes the
+  alembic-0012 column. `PassthroughReconciler` (today's
+  default) produces a structurally complete payload
+  with one `per_unit_verdict` entry per finding so the
+  portal Per-Unit Verdicts panel renders the
+  single-unit case correctly.
+- **New config block**:
+  `audit.agentic.transport.coder_service.{endpoint,
+  bearer_token_env, request_timeout_safety_seconds,
+  project}` mirroring the existing `coder.endpoint`
+  shape so operators reuse one mental model. New env
+  vars: `XAUDITOR_AUDIT_AGENTIC_TRANSPORT_CODER_SERVICE_*`.
+
+### Changed
+
+- **`AgentTransport` Protocol slimmed**:
+  `invoke(...)` drops `tool_grants: ToolGrants` (the
+  coder-service container is the security sandbox;
+  finer per-tool grants configure via claude's own
+  settings inside the container, not per-call) and
+  `max_tool_calls: int` (real `claude` CLI has no
+  tool-count limit; wall-clock `timeout_seconds` is the
+  only enforceable bound). Adds optional `project:
+  str | None = None` for workspace routing.
+- **Default `audit.agentic.transport.kind` flips** from
+  `"subprocess"` to `"coder_service"`.
+  `_AGENTIC_TRANSPORT_KINDS` is now `("coder_service",)`
+  — only the coder-service transport is supported in
+  production.
+
+### Removed
+
+- **`SubprocessAgentTransport` removed entirely.** The
+  original assumed `claude-code` CLI flags
+  (`--tool-grants`, `--max-tool-calls`, `--timeout`,
+  `--response-schema`) that don't exist on the real
+  `claude` binary; it was never exercised against a
+  live install (only against `MockAgentTransport`).
+  Removing it cleans up dead code and focuses the
+  transport surface on the production coder-service
+  path.
+- **`ToolGrants` dataclass removed** (no remaining
+  consumer).
+- **`AuditAgenticToolsConfig` removed** + the
+  `audit.agentic.tools.*` config block. Operators
+  configure per-tool restrictions via claude's own
+  `~/.claude/settings.json` inside the coder-service
+  container.
+- **`audit.agentic.max_tool_calls` config field
+  removed** + `XAUDITOR_AUDIT_AGENTIC_MAX_TOOL_CALLS`
+  env var. Cost capped via `timeout_seconds` only.
+- **`audit.agentic.transport.claude_code_binary` field
+  removed** + `XAUDITOR_AUDIT_AGENTIC_TRANSPORT_CLAUDE_CODE_BINARY`
+  env var. The binary lives inside the coder-service
+  container, not on the xauditor side.
+
+### Latent bug fix
+
+- **`PromptStageRunner.run_analyzer` `del unit` bug
+  fixed.** The Phase 4A code had `del unit` immediately
+  followed by a use of `unit` in the wrapped
+  `analyzer_agent.run(...)` call. The bug surfaced now
+  that the workflow actually invokes the runner; was
+  masked under Phase 4A because nothing exercised the
+  runner against a live workflow.
+
+### Deep-mode team re-platform (Phase 2)
+
+- **AnalyzerTeam + ExploiterTeam now accept
+  `agentic_stage_runner` + `personas` ctor kwargs.** When
+  set (workflow's `from_config` passes them under
+  `audit.stages.form: agentic`), per-replica `_invoke(...)`
+  dispatches through `self.agentic_stage_runner.run_*(...)`
+  with `personas[index]` instead of constructing
+  per-replica per-provider `AnalyzerAgent` /
+  `ExploitationAgent` instances. The transport (one
+  shared `CoderServiceAgentTransport`) handles all replica
+  calls; per-replica diversity comes from persona
+  injection (each replica's call carries a distinct
+  `extra_system_prefix`). Per-replica record metadata:
+  `provider_name="coder-service"`,
+  `model_name=<persona.name>`. The existing dedup
+  pipeline (LLM-judge consolidation) operates on these
+  records unchanged.
+- **`ExploiterTeam._synth_validator_from_context(...)`
+  bridge.** The legacy `ExploitationAgent.run(...)` took
+  a `validator_context` dict; `AgenticStageRunner.run_exploiter(...)`
+  requires a typed `ValidationResult`. The bridge
+  reconstructs one from the context dict (or defaults to
+  Inconclusive when missing).
+- **Workflow `from_config` reordered.**
+  `build_stage_runner` + `build_reconciler` calls hoisted
+  above team construction so the constructed
+  `AgenticStageRunner` can be passed into AnalyzerTeam +
+  ExploiterTeam.
+
+### Deferred to follow-up
+
+- **Phase 2 — ValidatorTeam re-platform.** ValidatorTeam
+  still uses today's per-replica per-provider
+  ValidatorAgent path. Its multi-round `_run_debate(...)`
+  machinery uses `model.invoke_text` with a shared
+  memory buffer per round — semantics that don't fit the
+  one-shot `stage_runner.run_validator(...)` surface.
+  Re-platforming the debate deserves its own change with
+  thoughtful design. In agentic deep mode today, the
+  validator stage runs prompt-form (same as deep prompt
+  mode).
+- **Per-finding transcript attribution.** MVP attaches
+  the same per-unit transcript list to every finding
+  produced for that unit (per-unit attribution).
+  Per-finding attribution (one transcript subset per
+  finding) is a follow-up if reviewer feedback
+  indicates it's useful.
+
+### Schema
+
+- **No new alembic migrations.** Reuses the existing
+  `agentic_transcript` (alembic 0013) and
+  `reconciliation` (alembic 0012) JSONB columns
+  reserved by earlier changes.
+
+## [1.2.0] - 2026-05-04
+
+Coordinated 1.2.0 release closing out Phases 2-5 of
+`restructure-audit-modes-and-coverage` plus
+`agentic-stage-runner-real` Phase 1+2. Adds the per-audit-unit
+`GraphSlice` broadening, the `AuditUnit` Protocol seam, the
+`StageRunner` Protocol with shipped `PromptStageRunner`, the
+`AgenticStageRunner` real implementation backed by a
+subprocess `claude-code` transport, the cross-unit
+reconciler skeleton + `AgenticReconciler`, the Coverage
+Gaps payload, and the per-mode persona seeding.
+
+### GraphSlice — per-unit context broadening (Phase 2A)
+
+- New `GraphSlice` dataclass replaces the per-audit-unit
+  `path_context` dict. Backwards-compatible: the legacy
+  three keys (`call_chain`, `function_definitions`,
+  `referenced_symbols`) continue to land at the top level
+  of the per-stage payload so existing prompts read them
+  unchanged.
+- Five new context fields added under
+  `audit.experimental.graph_slice` (default `false`):
+  - `entry_classification` — `EntryKind` heuristic
+    (`public_http` / `admin_http` / `internal_rpc` /
+    `cron` / `cli` / `test_only` / `unknown`) derived
+    from the entry function name + file path.
+  - `type_context` — type annotations + ORM-column
+    detection on referenced symbols.
+  - `cross_path_definitions` — for symbols read on the
+    path but defined in functions outside it, the
+    definition sites. Solves the "sanitization happened
+    on a sibling path" false-negative class.
+  - `decorator_chain` — every decorator applied to
+    functions on the path. Reserved for the
+    `capture-decorators-and-registrations` follow-up.
+  - `registration_context` — framework-registration sites
+    that bind functions into request / task pipelines.
+    Reserved for the same follow-up.
+- The first three fields ship usable data immediately
+  because they read from existing `ModuleSymbolRecord` /
+  `USES_SYMBOL` / `DECLARES_SYMBOL` data. The last two
+  require the graph builder to capture `DECORATES` /
+  `REGISTERS` edges and stay deferred.
+- New env var: `XAUDITOR_AUDIT_EXPERIMENTAL_GRAPH_SLICE`.
+- → [`docs/audit-modes.md#graphslice--per-unit-context-broadening-experimental`](docs/audit-modes.md#graphslice--per-unit-context-broadening-experimental)
+
+### AuditUnit Protocol seam (Phase 3A)
+
+- New `AuditUnit` Protocol with six concrete kinds:
+  `PathAuditUnit` (the historical default) plus typed
+  shells for `sink`, `entry`, `state`, `boundary`, and
+  `config`. Today's planner emits only `path` units
+  regardless of `audit.mode`. The remaining kinds light
+  up once `capture-decorators-and-registrations` adds
+  sink labels + decorator capture to the graph builder.
+- The stage runners and the workflow consume the
+  `AuditUnit.unit_kind` + `to_*_payload(...)` surface
+  exclusively; downstream code is unit-shape-agnostic.
+- → [`docs/audit-units.md`](docs/audit-units.md)
+
+### StageRunner seam + Persona + cost estimate (Phase 4A)
+
+- New `StageRunner` Protocol with `run_analyzer` /
+  `run_validator` / `run_exploiter` methods. Ships
+  `PromptStageRunner` (wraps the existing
+  `AnalyzerAgent` / `ValidatorAgent` /
+  `ExploitationAgent` flow) as the default real
+  implementation.
+- New `audit.stages.form` config (default `prompt`) +
+  `XAUDITOR_AUDIT_STAGES_FORM` env binding selects
+  between `prompt` and `agentic`. Phase 4A's `agentic`
+  shipped as a stub raising `NotImplementedError`; the
+  real implementation lands in this release via
+  `agentic-stage-runner-real`.
+- New `audit.personas` config block + `Persona`
+  dataclass + `DEFAULT_DEEP_PERSONAS` (data_flow /
+  auth_boundaries / config_assumptions). Deep mode runs
+  cycle through the personas across replicas to give the
+  dedup pipeline non-trivially-different candidates.
+  `tool_emphasis` is consumed by `AgenticStageRunner`;
+  `PromptStageRunner` ignores it.
+- Pre-flight cost estimate emitted to stderr (and the
+  run logger) before any LLM call so operators see the
+  worst-case token spend up front. Conservative — actual
+  runs typically land at 30-60% of the estimate.
+- → [`docs/audit-modes.md#stage-form-prompt-vs-agentic-phase-4`](docs/audit-modes.md#stage-form-prompt-vs-agentic-phase-4)
+
+### Coverage Gaps + reconciler skeleton (Phase 5A)
+
+- Every audit run emits a `Coverage Gaps` payload
+  (Markdown section + JSON top-level field + portal
+  Coverage panel) naming the vulnerability classes the
+  run covered, the classes a different mode would have
+  covered, and the classes outside xauditor's scope
+  altogether. Per-mode taxonomy mapped per `audit.mode`
+  and the available `AuditUnit` kinds.
+- New `audit.coverage_gaps.report` config (default
+  `true`) + `XAUDITOR_AUDIT_COVERAGE_GAPS_REPORT` env
+  binding suppresses the section when set false.
+- New `Reconciler` Protocol + `PassthroughReconciler`
+  (groups by finding fingerprint, returns each group's
+  first finding unchanged — structural no-op for path-
+  only audits). The `reconciler` v1 stage prompt is
+  reserved in the registry for the agentic
+  implementation.
+- New alembic migration `0012_findings_reconciliation`
+  adds the nullable JSONB `reconciliation` column to
+  `report.findings` for the per-finding
+  `{per_unit_verdicts, consolidated_verdict,
+  consolidation_reasoning}` payload.
+- → [`docs/audit-modes.md#coverage-gaps-phase-5`](docs/audit-modes.md#coverage-gaps-phase-5)
+
+### Real `AgenticStageRunner` (`agentic-stage-runner-real` Phase 1+2)
+
+- `AgenticStageRunner` is no longer a stub. It backs onto
+  a new `AgentTransport` Protocol with
+  `SubprocessAgentTransport` shipped today (invokes a
+  `claude-code` binary via subprocess with constrained
+  tool grants, hard `max_tool_calls` + `timeout_seconds`
+  budgets, and structured response parsing).
+- New `audit.agentic.*` config block + env-var bindings
+  governing tool grants, the cost budget, and the
+  transport choice. Defaults: `max_tool_calls: 30`
+  (bounded `[1, 200]`), `timeout_seconds: 300`
+  (bounded `[10, 1800]`), all read-only tools enabled,
+  `transport.kind: subprocess`,
+  `transport.claude_code_binary: claude-code`.
+- New stage prompts `analyzer_agentic` / `validator_agentic`
+  / `exploiter_agentic` (v1) — tool-using formulations
+  selected by `audit.stages.form: agentic`. Falls back to
+  the prompt-form variants when the agentic key is
+  unset.
+- Persona injection is real for the agentic runner: each
+  persona's `extra_system_prefix` is appended to the
+  stage's system prompt verbatim, and `tool_emphasis` is
+  forwarded as a hint.
+- New `AgenticReconciler` consumes the parent change's
+  `reconciler` v1 prompt via the same transport.
+  Single-unit groups shortcut to passthrough (no agent
+  call); multi-unit groups invoke the reconciler agent
+  once per group.
+- New transport startup probe (`claude-code --version`
+  at construction time) fails fast with the offending
+  config field name in the error message when the
+  binary is missing.
+- New transport fallback path: subprocess non-zero exit,
+  timeout, max-tool-calls without `final_answer`, or
+  malformed response JSON all produce a structured
+  fallback `AgentResult` with `fell_back: True` so
+  downstream callers can distinguish "agent declined"
+  from "agent crashed".
+- New alembic migration `0013_findings_agentic_transcript`
+  adds the nullable JSONB `agentic_transcript` column
+  to `report.findings` reserved for the per-finding
+  transport transcript (one tool call per JSON entry).
+- → [`docs/agentic-stage-runner.md`](docs/agentic-stage-runner.md)
+
+### Schema migrations (`xauditor-portal`)
+
+- **`0012_findings_reconciliation`** — adds nullable
+  JSONB `reconciliation` column to `report.findings`.
+  Idempotent.
+- **`0013_findings_agentic_transcript`** — adds nullable
+  JSONB `agentic_transcript` column to `report.findings`.
+  Idempotent.
+
+### Portal + frontend
+
+- Run-detail Coverage panel + per-finding Per-Unit
+  Verdicts panel surface the new `coverage_gaps` and
+  `reconciliation` JSONB payloads. New
+  `audit.coverage_gaps.report` toggle in the Settings
+  page's "Audit mode → Advanced overrides" section.
+- → [`packages/xauditor-portal/CHANGELOG.md`](packages/xauditor-portal/CHANGELOG.md)
+  for the full portal 1.1.0 release notes.
+
+### Deferred to follow-up
+
+- **Workflow re-platform onto `StageRunner.run_*`.**
+  `_process_unit_single` and `_process_unit_teaming`
+  still call the prompt agents directly. The Phase 2.2
+  re-platform of `agentic-stage-runner-real` is the
+  remaining gap that lights up `audit.stages.form:
+  agentic` end-to-end in production. Until then, the
+  agentic runner is constructed + tested via mock
+  transports but the live audit chain routes through
+  `PromptStageRunner` semantics (which call the same
+  agents the workflow already invokes directly today).
+- **Transcript persistence wiring.** Finding dataclass
+  doesn't yet carry `agentic_transcript`; the Postgres
+  sink doesn't yet write the column. Both depend on the
+  workflow re-platform.
+- **Decorator + registration capture.** `decorator_chain`
+  and `registration_context` GraphSlice fields stay
+  empty until `capture-decorators-and-registrations`
+  ships the graph-builder enhancements.
+- **Sink / Entry / State / Boundary / Config audit
+  units.** Planner + executor exist as Protocol shells;
+  the planner emits only `path` units today.
+- **Real-transport FP comparison test** (gated on
+  `XAUDITOR_TEST_AGENTIC_REAL=1` because it spends
+  real LLM credits) is documented but not yet shipped.
+
+## [1.1.0] - 2026-05-04
+
+`restructure-audit-modes-and-coverage` Phase 1: rename audit modes
+to `fast` / `deep`, fix the per-unit stage order across all modes,
+and add a fast-mode iterative analyzer so a single audit unit can
+produce multiple distinct findings.
+
+### Audit modes (`fast` / `deep`)
+
+- **Renamed** the audit-mode preset from `single` / `team` (a.k.a.
+  `teaming.enabled: false` / `true`) to `fast` / `deep`. The new
+  shape lives under `audit.mode` plus
+  `audit.replication.{analyzer,validator,exploiter}`,
+  `audit.validator.debate.{enabled,max_rounds,halt_on_consensus}`,
+  and `audit.max_findings_per_unit`. Workflow code reads the
+  resolved per-axis values; `audit.mode` is purely a preset that
+  defaults the other fields. → [`docs/audit-modes.md`](docs/audit-modes.md)
+- **Default mode** is `fast` — operators who never set
+  `audit.mode` (or who used `teaming.enabled: false`) see no
+  behaviour change beyond the stage reorder below.
+
+### Stage reorder (all modes)
+
+- The per-unit workflow now executes **`Analyzer → Validator →
+  Exploiter`**. The validator's payload no longer carries
+  exploitation context in any mode (it never could in the
+  pre-existing teaming path; this change brings the single-mode
+  path into alignment). The exploiter is **skipped** when the
+  validator emits `False Positive`, saving a stage call per FP
+  finding (typically 30-60% of analyzer candidates).
+- The exploiter MAY emit `status: "not_exploitable"`, in which
+  case the workflow downgrades a `Valid` verdict to
+  `Partial Valid` and prepends an `[exploiter downgrade] ...`
+  marker to the validation analysis. The validator is NOT
+  re-invoked (one-way feedback).
+- `validator_teaming` v1 prompt was deleted — the regular
+  `validator` v3 prompt now applies in every mode.
+
+### Fast-mode iterative analyzer (multi-finding-per-unit)
+
+- `_process_unit_single` now runs a bounded loop. Each round
+  passes the analyzer an `excluded_findings` summary list of
+  every accepted candidate so far; the analyzer is asked to
+  return ONE additional distinct candidate or
+  `status: "no_issue"`. Loop terminates on
+  two-consecutive-`no_issue` OR
+  `len(accepted) >= audit.max_findings_per_unit` (default `3`,
+  bounded `[1, 20]`).
+- Each surviving candidate runs the validator → exploiter chain
+  independently; results land in the existing `per_finding`
+  tuple. No aggregator changes.
+- Iteration metadata is persisted to
+  `path_shared_state["analyzer_iterations"]` (round_count,
+  accepted, next_round_excluded, terminated_by) for resume.
+- Emits `"max_findings_per_unit cap reached"` warning when the
+  cap caps the loop. Deep-mode counterpart:
+  `"replication-cap reached"` when every analyzer replica
+  produces a distinct surviving candidate.
+
+### Schema migration (`xauditor-portal`)
+
+- New alembic migration **`0011_audit_mode_rename`**:
+  - Rewrites historical `audit_runs.mode` values
+    (`single` → `fast`, `team` → `deep`) in place.
+  - Adds nullable JSONB column `coverage_gaps` to `audit_runs`
+    (column added in Phase 1, populated by Phase 5 of the same
+    spec change).
+  - Idempotent. Documented as forward-only by intent — the
+    `'fast' → 'single'` reverse loses information once Phase 5
+    deep-mode coverage has run on a row.
+
+### Portal + frontend
+
+- Run-list badge labels: "Single mode" / "Team mode" → "Fast
+  mode" / "Deep mode".
+- Settings page section "Teaming" → "Audit mode"; the new
+  `AuditModeSection` component surfaces the `audit.mode` enum,
+  per-stage replication, validator-debate knobs, and the
+  per-unit finding cap. Legacy `teaming.<stage>.provider_list`
+  chips remain available under "Advanced overrides → Provider
+  rotation (legacy)" because the audit workflow still consumes
+  them for provider rotation in deep mode (rewrite onto the
+  `audit.*` shape comes in a follow-up change).
+- Finding-card debate panel visibility predicate switches from
+  `runMode === "team"` to `runMode === "deep"`.
+- Settings TOC entry renamed to `section-audit-mode`.
+
+### Backward compatibility
+
+- **Legacy `teaming.*` yaml** continues to work for one minor
+  release (this release). On config load, `_migrate_legacy_teaming`
+  translates each populated `teaming.*` field to the new
+  `audit.*` shape in-place and emits one `DeprecationWarning`
+  per legacy field, naming the new dot-path. Operators can
+  mechanically rewrite their yaml from the warning text. The
+  shim is removed in **`1.2.0`**.
+- **Legacy `XAUDITOR_TEAMING_*` env vars** are still recognised
+  via the same shim with the same deprecation timeline.
+- **Legacy `audit_runs.mode = 'single'/'team'` rows** are
+  rewritten in place by migration 0011 the next time
+  `alembic upgrade head` runs. Operators on shared databases
+  who roll back to a pre-`1.1.0` xauditor must rerun the
+  migration's downgrade path manually (documented as
+  not-CI-exercised in the migration's docstring).
+- **Test stub signatures**: every analyzer stub
+  (`run(*, unit, path_functions, path_context)`) gained an
+  `excluded_findings=()` kwarg; every validator stub
+  (`run(*, unit, analyzer, exploitation, path_context)`)
+  changed `exploitation` to optional with default `None`. In-tree
+  test stubs were updated; downstream test suites need the
+  same kwarg signature change.
+
+### Removed
+
+- `xauditor.prompts.VALIDATOR_TEAMING_PROMPT*` symbols.
+  `get_prompt_definition("validator_teaming")` now raises
+  `KeyError` (covered by a regression test so a future
+  re-introduction is intentional).
+
+### Deferred to follow-up
+
+- Resume-read-path integration of the new
+  `analyzer_iterations` metadata. The metadata is written
+  today; `services.resume_audit` consuming it (skip
+  already-completed candidates on a resumed mid-loop run)
+  lands as a small follow-up commit in the
+  `restructure-audit-modes-and-coverage` series.
+- Provider-rotation rewrite from `teaming.<stage>.provider_list`
+  onto an `audit.*` field. Deferred to Phase 1B+ of the same
+  spec change.
+
 ## [1.0.0] - 2026-05-02
 
 ### Coder service (`xauditor-coder-service`)

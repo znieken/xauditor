@@ -105,8 +105,12 @@ override counts on its summary).
 - `repository.excludes` (chip input)
 - `graph.build.{enable_llm_enrichment, max_file_bytes, paths_max_depth, paths_max_count, neo4j_chunk_size}`
 - `audit.worker_count`
-- `teaming.enabled`, `teaming.{analyzer,validator,exploiter}.{subagent_count, provider_list}`,
-  `teaming.validator.debate_rounds` (chip input for `provider_list`)
+- `audit.mode` (`fast` / `deep`), `audit.replication.{analyzer,validator,exploiter}`,
+  `audit.validator.debate.{enabled,max_rounds}`, `audit.max_findings_per_unit`
+- Legacy `teaming.{analyzer,validator,exploiter}.provider_list` (chip
+  input for provider rotation; required when `audit.mode` is `deep`
+  until provider rotation is rewritten onto the `audit.*` shape in a
+  follow-up change)
 - `coder.*` operational + infrastructure knobs (HTTP- and container-only
   fields auto-disable when transport / endpoint conditions don't match;
   deprecated `coder.repo_mount_path` is not exposed)
@@ -308,7 +312,7 @@ obvious credentials in finding bodies are stripped before export.
 ## Run hierarchy
 
 The Report tab top-level view lists every audit run with project name,
-repo path, `team` / `single` mode badge, status, live progress
+repo path, `fast` / `deep` mode badge, status, live progress
 percentage, and aggregate finding counts (total / valid / false
 positives / unlabeled).
 
@@ -317,7 +321,7 @@ Opening a run reveals three sub-tabs:
 - **Findings** — filterable list of finding cards (collapsed by
   default; expand to see every field plus syntax-highlighted source
   snippets, referenced symbols, exploitation steps, validation
-  analysis, and the feedback control). For team-mode runs the
+  analysis, and the feedback control). For deep-mode runs the
   expanded body also includes a **Validator debate** section
   rendered inline as a `<details>` element (folded by default);
   expanding it shows the full per-round transcript — final verdict,
@@ -325,10 +329,62 @@ Opening a run reveals three sub-tabs:
   subagents, verdicts, rebuttals, and raw responses — plus the path
   fingerprint footer. The chip appears on the collapsed header only
   when the backend has a debate row joined to that finding.
+  Above the findings list, the **Coverage panel** (see below)
+  surfaces the per-mode Coverage Gaps payload; expanded finding
+  cards additionally render a **Per-Unit Verdicts panel** when
+  the cross-unit reconciler consolidated multiple per-unit
+  verdicts into one finding.
 - **Coverage** — modules / files / functions audited vs unaudited vs
-  excluded vs skipped.
+  excluded vs skipped. (Distinct from the Coverage panel above —
+  this sub-tab is symbol-level; the panel is vulnerability-class-level.)
 - **Audit Log** — `progress_events` timeline (`started` →
   `progress` → `stage_completed` → `finished` / `failed`).
+
+### Coverage panel (Findings sub-tab)
+
+The Coverage panel renders directly above the findings list and
+mirrors the run's `coverage_gaps` JSONB payload (Phase 5A+). Three
+groups, color-tagged:
+
+- **Audited** — vulnerability classes the run actually covered
+  (success tone).
+- **Skipped by mode** — classes a different `audit.mode` would
+  have covered (warning tone). In fast-mode runs this group
+  drives the **CTA banner** at the top of the panel: a
+  copy-to-clipboard button for `xauditor audit run --mode deep`,
+  dismissable per run via a `localStorage` key
+  (`coverage-cta-dismissed-{runId}`).
+- **Out of scope** — classes xauditor structurally cannot cover
+  (e.g. `supply_chain`, `cryptographic_primitives`); use the
+  named external tooling (neutral tone).
+
+Default expansion: fast-mode runs with a non-empty
+`skipped_by_mode` group default to expanded; deep-mode runs default
+to collapsed. Pre-Phase-5 runs (no `coverage_gaps` JSONB) render
+a `n/a — pre-Phase-5 audit` placeholder instead.
+
+The `audit.coverage_gaps.report` toggle in the **Settings → Audit
+mode → Advanced overrides** section suppresses the panel by
+emitting `coverage_gaps: null` on subsequent audit runs.
+
+### Per-Unit Verdicts panel (finding card)
+
+When the cross-unit reconciler consolidates multiple per-unit
+verdicts into a single finding (e.g. the same SQL-injection finding
+surfaces from both a `PathAuditUnit` and a `SinkAuditUnit`), the
+finding card's expanded body renders a **Per-Unit Verdicts panel**
+directly under the Validation Analysis lines. Each row shows the
+unit-kind badge, color-coded per-unit verdict, and a truncated
+analysis (click the row to expand the full text). When the
+reconciler emitted a `consolidation_reasoning` prose block, it
+renders below the per-unit list.
+
+Phase 5A's `PassthroughReconciler` writes `NULL` to the
+`findings.reconciliation` JSONB column for path-only audits, so
+the panel returns `null` and the card stays compact. The panel
+lights up once the agentic reconciler from
+`agentic-stage-runner-real` runs against multi-unit-finding
+fixtures.
 
 Per-subagent outputs (analyzer / validator / exploiter) remain
 reachable via the REST API rather than as dedicated sub-tabs.

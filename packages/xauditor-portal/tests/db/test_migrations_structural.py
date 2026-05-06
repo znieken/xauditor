@@ -83,6 +83,27 @@ class MigrationRevisionPointersTests(unittest.TestCase):
         self.assertEqual(revision, "0006_audit_runs_resume_state")
         self.assertEqual(down, "0005_coder_findings")
 
+    def test_0011_audit_mode_rename_follows_0010(self) -> None:
+        path = VERSIONS_DIR / "0011_audit_mode_rename.py"
+        self.assertTrue(path.exists(), "0011 migration must ship in the package")
+        revision, down = self._revision_pair(path)
+        self.assertEqual(revision, "0011_audit_mode_rename")
+        self.assertEqual(down, "0010_audit_run_admin_actions")
+
+    def test_0012_findings_reconciliation_follows_0011(self) -> None:
+        path = VERSIONS_DIR / "0012_findings_reconciliation.py"
+        self.assertTrue(path.exists(), "0012 migration must ship in the package")
+        revision, down = self._revision_pair(path)
+        self.assertEqual(revision, "0012_findings_reconciliation")
+        self.assertEqual(down, "0011_audit_mode_rename")
+
+    def test_0013_findings_agentic_transcript_follows_0012(self) -> None:
+        path = VERSIONS_DIR / "0013_findings_agentic_transcript.py"
+        self.assertTrue(path.exists(), "0013 migration must ship in the package")
+        revision, down = self._revision_pair(path)
+        self.assertEqual(revision, "0013_findings_agentic_transcript")
+        self.assertEqual(down, "0012_findings_reconciliation")
+
 
 if __name__ == "__main__":
     unittest.main()

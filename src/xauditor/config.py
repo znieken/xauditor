@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
@@ -273,6 +274,29 @@ class AuditConfig:
     worker_count: int = 1
     shutdown_timeout_seconds: int = 30
     coder_shutdown_timeout_seconds: int = 20
+    sinks: "AuditSinksConfig" = field(default_factory=lambda: AuditSinksConfig())
+
+
+@dataclass(frozen=True)
+class AuditSinksConfig:
+    """Operator-tunable sink list for SinkAuditUnit enumeration.
+
+    `well_known` is an OPTIONAL allow-list. When empty (default),
+    every entry in `xauditor.graph.sink_labelling._DEFAULT_SINK_TABLE`
+    is in scope. When non-empty, only the listed FQNs are eligible
+    (operator pruned the default list). Useful when an operator
+    knows their codebase doesn't use, e.g., `pickle.loads` and wants
+    to suppress the noise.
+
+    `custom` is an additive allow-list of operator-defined FQNs not
+    in the default table. The sink_kind for entries in `custom` is
+    "" (uncategorized) since the config shape doesn't carry per-FQN
+    sink_kind. A future change may upgrade `custom` to a richer
+    dict-shape mapping FQN → sink_kind if operators ask for it.
+    """
+
+    well_known: tuple[str, ...] = ()
+    custom: tuple[str, ...] = ()
 
 
 PROVIDER_KIND_OPENAI = "openai"
@@ -414,6 +438,241 @@ class TeamingConfig:
     exploiter: ExploiterTeamConfig = field(default_factory=ExploiterTeamConfig)
 
 
+# =====================================================================
+# Audit modes (`fast` / `deep`) — replaces the historical `teaming.*`
+# configuration namespace per `restructure-audit-modes-and-coverage`.
+#
+# Phase 1 introduces the new dataclasses alongside the legacy
+# `TeamingConfig`. Both are populated for the duration of Phase 1 so
+# downstream code (`audit/workflow.py`, `audit/agents.py`) that still
+# reads `config.teaming.*` keeps working. Phase 1B rewrites the
+# workflow to read from `config.audit_mode.*` and drops the legacy
+# field.
+#
+# Yaml-level migration: when a config file has `teaming.*` keys but
+# no `audit.mode`, `_migrate_legacy_teaming` derives the equivalent
+# `audit.*` shape and emits one `DeprecationWarning` per legacy key.
+# =====================================================================
+
+
+AUDIT_MODE_VALUES: tuple[str, ...] = ("fast", "deep")
+
+
+@dataclass(frozen=True)
+class AuditReplicationConfig:
+    """Per-stage subagent replication count.
+
+    Default (`1, 1, 1`) is fast-mode behaviour. Deep mode resolves to
+    `(3, 3, 1)` — three analyzer / validator replicas with personas
+    diversifying their attention; one exploiter (constructive stage,
+    no value in fanning out)."""
+
+    analyzer: int = 1
+    validator: int = 1
+    exploiter: int = 1
+
+
+@dataclass(frozen=True)
+class ValidatorDebateConfig:
+    """Validator debate parameters.
+
+    Only meaningful when `replication.validator > 1`. `halt_on_consensus`
+    short-circuits the debate when all replicas already agree before
+    `max_rounds`. When `max_rounds` is reached without convergence,
+    xauditor persists `validation_status = Inconclusive` rather than
+    forcing a tiebreaker verdict."""
+
+    enabled: bool = False
+    max_rounds: int = 5
+    halt_on_consensus: bool = True
+
+
+@dataclass(frozen=True)
+class AuditAnalyzerStageConfig:
+    """Per-stage analyzer config under the new `audit.analyzer` namespace.
+
+    Owns `provider_list` (the `index % len(provider_list)` rotation
+    target for deep-mode replicas). Replica count lives separately at
+    `audit.replication.analyzer` to keep the existing env-var shape
+    stable.
+    """
+
+    provider_list: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class AuditValidatorStageConfig:
+    """Per-stage validator config under the new `audit.validator` namespace.
+
+    Bundles the validator's `provider_list` rotation field with the
+    existing `debate` block (kept under the same `audit.validator.*`
+    yaml prefix). Replica count lives at `audit.replication.validator`.
+    """
+
+    provider_list: tuple[str, ...] = ()
+    debate: ValidatorDebateConfig = field(default_factory=ValidatorDebateConfig)
+
+
+@dataclass(frozen=True)
+class AuditExploiterStageConfig:
+    """Per-stage exploiter config under the new `audit.exploiter` namespace.
+
+    Owns `provider_list`. Replica count lives at
+    `audit.replication.exploiter`.
+    """
+
+    provider_list: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class AuditExperimentalConfig:
+    """Per-phase feature flags for the
+    `restructure-audit-modes-and-coverage` rollout.
+
+    Each flag gates one phase's new behaviour for a release cycle so
+    operators can adopt incrementally. The flag name matches the
+    phase that ships it; once a flag has had a stable release with
+    `default=true`, it is removed in the next minor release and the
+    behaviour becomes unconditional.
+
+    - `units` (Phase 3): enables the AuditUnit Protocol seam in
+      the planner's `enumerate_units` output. Phase 3A only ever
+      emits `PathAuditUnit` regardless of the flag, but the
+      Protocol surface (`as_audit_unit`, `to_*_payload`,
+      `unit_kind`, `fingerprint`) is available for Phase 4/5
+      consumers. When the flag is on AND a future graph-builder
+      change adds sink / entry / state / boundary / config
+      enumeration, those unit kinds will start appearing in the
+      plan; until then the flag is a no-op on output.
+    """
+
+    units: bool = False
+
+
+AUDIT_STAGES_FORM_VALUES: tuple[str, ...] = ("prompt", "agentic")
+
+
+_AGENTIC_TRANSPORT_KINDS: tuple[str, ...] = ("coder_service",)
+
+
+@dataclass(frozen=True)
+class AuditAgenticTransportCoderServiceConfig:
+    """coder-service transport tunables. Mirrors `coder.endpoint`
+    shape so operators reuse one mental model for both Coder and
+    agentic transports.
+    """
+
+    endpoint: str = "http://127.0.0.1:8090"
+    bearer_token_env: str = ""  # empty → no Authorization header
+    request_timeout_safety_seconds: int = 60
+    project: str = ""  # empty → legacy single-repo container path
+
+
+@dataclass(frozen=True)
+class AuditAgenticTransportConfig:
+    """Selection + tunables for the `AgentTransport` implementation."""
+
+    kind: str = "coder_service"
+    coder_service: AuditAgenticTransportCoderServiceConfig = field(
+        default_factory=AuditAgenticTransportCoderServiceConfig
+    )
+
+
+@dataclass(frozen=True)
+class AuditAgenticConfig:
+    """Cost-budget + transport tunables for the real
+    `AgenticStageRunner` (`wire-agentic-into-workflow`).
+
+    The runner consults these values per stage call. `timeout_seconds`
+    is the only enforceable per-call cost cap — there is no
+    `max_tool_calls` (the real `claude` CLI has no tool-count limit
+    flag; wall-clock kill is the only bound) and no per-call budget
+    cap. Operators on cost-tight CI shrink `timeout_seconds` and tune
+    `XAUDITOR_CODER_SERVICE_MAX_CONCURRENT` for total parallelism.
+
+    `tools` config dropped in `wire-agentic-into-workflow`: the
+    coder-service container is the security sandbox; per-tool grants
+    configure via claude's own settings inside the container, not
+    per-call.
+    """
+
+    timeout_seconds: int = 300
+    transport: AuditAgenticTransportConfig = field(
+        default_factory=AuditAgenticTransportConfig
+    )
+
+
+@dataclass(frozen=True)
+class AuditPersonaConfig:
+    """One operator-supplied persona for deep-mode replica seeding.
+
+    Mirrors `xauditor.audit.stage_runner.Persona` but lives in
+    `config.py` to avoid an import cycle (the runner imports from
+    config, not the other way round). The runner converts these
+    config records into runtime `Persona` instances at workflow
+    construction time.
+    """
+
+    name: str
+    focus_summary: str = ""
+    extra_system_prefix: str = ""
+    tool_emphasis: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class AuditModeConfig:
+    """Audit-mode preset and its resolved per-axis values.
+
+    `mode` is a two-value enum (`fast` | `deep`) that acts as a preset
+    for the other fields. Operators MAY override any field directly;
+    workflow code reads the resolved per-axis values and SHALL NOT
+    branch on `mode` itself.
+
+    `max_findings_per_unit` caps the fast-mode iterative analyzer loop
+    (Phase 1B). Deep mode is implicitly capped at `replication.analyzer`
+    via the existing replicate-then-dedup pipeline.
+
+    `experimental` carries per-phase rollout flags (Phase 2 onward).
+
+    `stages_form` (Phase 4A): selects the per-stage execution form.
+    `"prompt"` (default) → `PromptStageRunner` (today's flow).
+    `"agentic"` → `AgenticStageRunner` (Phase 4A stub; raises
+    `NotImplementedError` until the Claude Code Agent SDK
+    integration follows up). The value is run-scoped today; per-
+    stage override is design.md open question 5.
+
+    `personas` (Phase 4A): operator-supplied persona list for deep
+    mode replica seeding. Empty list means "use
+    `DEFAULT_DEEP_PERSONAS`". Phase 5 may extend this with
+    per-stage personas.
+    """
+
+    mode: str = "fast"
+    replication: AuditReplicationConfig = field(default_factory=AuditReplicationConfig)
+    analyzer: AuditAnalyzerStageConfig = field(default_factory=AuditAnalyzerStageConfig)
+    validator: AuditValidatorStageConfig = field(default_factory=AuditValidatorStageConfig)
+    exploiter: AuditExploiterStageConfig = field(default_factory=AuditExploiterStageConfig)
+    max_findings_per_unit: int = 3
+    # `audit.graph_slice` (promoted from `audit.experimental.graph_slice`
+    # in 1.4.x): enables the v2 GraphSlice fields — `decorator_chain`,
+    # `registration_context`, `entry_classification`, `type_context`,
+    # `cross_path_definitions` — in the analyzer / validator payloads.
+    # Default `true` since these fields ship populated and reduce FP
+    # rate; operators rolling back to legacy three-field payloads set
+    # this to `false`. Legacy `audit.experimental.graph_slice` is
+    # accepted for one minor release with a deprecation warning.
+    graph_slice: bool = True
+    experimental: AuditExperimentalConfig = field(default_factory=AuditExperimentalConfig)
+    stages_form: str = "prompt"
+    personas: tuple[AuditPersonaConfig, ...] = ()
+    coverage_gaps_report: bool = True
+    agentic: AuditAgenticConfig = field(default_factory=AuditAgenticConfig)
+    """Phase 5A: emit a `## Coverage Gaps` section on every audit
+    report (Markdown + JSON + portal Coverage panel). Defaults to
+    true because the section is small and informative — operators
+    who don't want it set this to false."""
+
+
 @dataclass(frozen=True)
 class LLMSettings:
     default_provider: str = ""
@@ -537,6 +796,7 @@ class XAuditorConfig:
     llm: LLMSettings
     graph: GraphConfig = field(default_factory=GraphConfig)
     teaming: TeamingConfig = field(default_factory=TeamingConfig)
+    audit_mode: AuditModeConfig = field(default_factory=AuditModeConfig)
     reportdb: ReportDBConfig = field(default_factory=ReportDBConfig)
     portal: PortalConfig = field(default_factory=PortalConfig)
     coder: CoderConfig = field(default_factory=CoderConfig)
@@ -561,12 +821,17 @@ ENV_KEY_MAP = {
     "XAUDITOR_AUDIT_WORKER_COUNT": "audit.worker_count",
     "XAUDITOR_AUDIT_SHUTDOWN_TIMEOUT_SECONDS": "audit.shutdown_timeout_seconds",
     "XAUDITOR_AUDIT_CODER_SHUTDOWN_TIMEOUT_SECONDS": "audit.coder.shutdown_timeout_seconds",
+    "XAUDITOR_AUDIT_SINKS_WELL_KNOWN": "audit.sinks.well_known",
+    "XAUDITOR_AUDIT_SINKS_CUSTOM": "audit.sinks.custom",
     "XAUDITOR_REPOSITORY_EXCLUDES": "repository.excludes",
     "XAUDITOR_AGENTS_GRAPH_BUILDER_LLM_PROVIDER": "agents.graph_builder.llm.provider",
     "XAUDITOR_AGENTS_AUDITOR_LLM_PROVIDER": "agents.auditor.llm.provider",
     "XAUDITOR_AGENTS_EXPLOITATION_LLM_PROVIDER": "agents.exploitation.llm.provider",
     "XAUDITOR_AGENTS_VALIDATOR_LLM_PROVIDER": "agents.validator.llm.provider",
     "XAUDITOR_GRAPH_BUILD_ENABLE_LLM_ENRICHMENT": "graph.build.enable_llm_enrichment",
+    # Legacy `XAUDITOR_TEAMING_*` env vars are still recognised for
+    # one minor release. `_build_audit_config` emits a deprecation
+    # warning naming the new `audit.*` field per legacy field used.
     "XAUDITOR_TEAMING_ENABLED": "teaming.enabled",
     "XAUDITOR_TEAMING_ANALYZER_SUBAGENT_COUNT": "teaming.analyzer.subagent_count",
     "XAUDITOR_TEAMING_ANALYZER_PROVIDER_LIST": "teaming.analyzer.provider_list",
@@ -575,6 +840,32 @@ ENV_KEY_MAP = {
     "XAUDITOR_TEAMING_VALIDATOR_DEBATE_ROUNDS": "teaming.validator.debate_rounds",
     "XAUDITOR_TEAMING_EXPLOITER_SUBAGENT_COUNT": "teaming.exploiter.subagent_count",
     "XAUDITOR_TEAMING_EXPLOITER_PROVIDER_LIST": "teaming.exploiter.provider_list",
+    # New `audit.mode` / `audit.replication.*` / `audit.validator.debate.*`
+    # / `audit.max_findings_per_unit` env vars. Phase 1 lands these
+    # alongside the legacy `teaming.*` shim; Phase 1B+ rewrites the
+    # workflow to read from the new fields exclusively.
+    "XAUDITOR_AUDIT_MODE": "audit.mode",
+    "XAUDITOR_AUDIT_REPLICATION_ANALYZER": "audit.replication.analyzer",
+    "XAUDITOR_AUDIT_REPLICATION_VALIDATOR": "audit.replication.validator",
+    "XAUDITOR_AUDIT_REPLICATION_EXPLOITER": "audit.replication.exploiter",
+    "XAUDITOR_AUDIT_VALIDATOR_DEBATE_ENABLED": "audit.validator.debate.enabled",
+    "XAUDITOR_AUDIT_VALIDATOR_DEBATE_MAX_ROUNDS": "audit.validator.debate.max_rounds",
+    "XAUDITOR_AUDIT_VALIDATOR_DEBATE_HALT_ON_CONSENSUS": "audit.validator.debate.halt_on_consensus",
+    "XAUDITOR_AUDIT_ANALYZER_PROVIDER_LIST": "audit.analyzer.provider_list",
+    "XAUDITOR_AUDIT_VALIDATOR_PROVIDER_LIST": "audit.validator.provider_list",
+    "XAUDITOR_AUDIT_EXPLOITER_PROVIDER_LIST": "audit.exploiter.provider_list",
+    "XAUDITOR_AUDIT_MAX_FINDINGS_PER_UNIT": "audit.max_findings_per_unit",
+    "XAUDITOR_AUDIT_GRAPH_SLICE": "audit.graph_slice",
+    "XAUDITOR_AUDIT_EXPERIMENTAL_GRAPH_SLICE": "audit.experimental.graph_slice",
+    "XAUDITOR_AUDIT_EXPERIMENTAL_UNITS": "audit.experimental.units",
+    "XAUDITOR_AUDIT_STAGES_FORM": "audit.stages.form",
+    "XAUDITOR_AUDIT_COVERAGE_GAPS_REPORT": "audit.coverage_gaps.report",
+    "XAUDITOR_AUDIT_AGENTIC_TIMEOUT_SECONDS": "audit.agentic.timeout_seconds",
+    "XAUDITOR_AUDIT_AGENTIC_TRANSPORT_KIND": "audit.agentic.transport.kind",
+    "XAUDITOR_AUDIT_AGENTIC_TRANSPORT_CODER_SERVICE_ENDPOINT": "audit.agentic.transport.coder_service.endpoint",
+    "XAUDITOR_AUDIT_AGENTIC_TRANSPORT_CODER_SERVICE_BEARER_TOKEN_ENV": "audit.agentic.transport.coder_service.bearer_token_env",
+    "XAUDITOR_AUDIT_AGENTIC_TRANSPORT_CODER_SERVICE_REQUEST_TIMEOUT_SAFETY_SECONDS": "audit.agentic.transport.coder_service.request_timeout_safety_seconds",
+    "XAUDITOR_AUDIT_AGENTIC_TRANSPORT_CODER_SERVICE_PROJECT": "audit.agentic.transport.coder_service.project",
     "XAUDITOR_REPORTDB_IMAGE": "reportdb.image",
     "XAUDITOR_REPORTDB_PASSWORD": "reportdb.password",
     "XAUDITOR_REPORTDB_PORT": "reportdb.port",
@@ -658,8 +949,18 @@ def load_config(
     llm_settings = _build_llm_settings(data)
     llm_settings.validate(require_llm=require_llm)
 
+    # ``_migrate_legacy_teaming`` mutates ``data["audit"]`` in place
+    # when ``teaming.*`` keys are present and ``audit.mode`` is absent,
+    # so the subsequent ``_build_audit_config`` /
+    # ``_build_audit_mode_config`` calls see the resolved new-shape
+    # values. The teaming-side `_build_teaming_config` still runs
+    # downstream because legacy `XAuditorConfig.teaming` is consumed
+    # by the workflow until Phase 1B replaces it.
+    _migrate_legacy_teaming(data)
+
     graph_config = _build_graph_config(data)
     teaming_config = _build_teaming_config(data, llm_settings)
+    audit_mode_config = _build_audit_mode_config(data, llm_settings=llm_settings)
     graphdb_config = _build_neo4j_config(data)
     reportdb_config = _build_reportdb_config(data)
     portal_config = _build_portal_config(data)
@@ -675,6 +976,7 @@ def load_config(
         llm=llm_settings,
         graph=graph_config,
         teaming=teaming_config,
+        audit_mode=audit_mode_config,
         reportdb=reportdb_config,
         portal=portal_config,
         coder=coder_config,
@@ -746,10 +1048,26 @@ def _build_audit_config(data: Mapping[str, Any]) -> AuditConfig:
                 "audit.shutdown_timeout_seconds to silence this warning."
             ),
         )
+    audit_sinks_raw = audit_raw.get("sinks") or {}
+    if not isinstance(audit_sinks_raw, Mapping):
+        raise ConfigError(
+            "Invalid audit.sinks configuration; expected a mapping."
+        )
+    sinks = AuditSinksConfig(
+        well_known=_normalize_provider_list(
+            audit_sinks_raw.get("well_known", ()),
+            field_name="audit.sinks.well_known",
+        ),
+        custom=_normalize_provider_list(
+            audit_sinks_raw.get("custom", ()),
+            field_name="audit.sinks.custom",
+        ),
+    )
     return AuditConfig(
         worker_count=worker_count,
         shutdown_timeout_seconds=shutdown_timeout,
         coder_shutdown_timeout_seconds=coder_shutdown_timeout,
+        sinks=sinks,
     )
 
 
@@ -763,6 +1081,464 @@ def _normalize_bounded_int(
             f"expected a value in [{minimum}, {maximum}]."
         )
     return parsed
+
+
+# Mode preset → resolved per-axis values. Resolution happens at parse
+# time in ``_build_audit_mode_config``: the operator-supplied yaml
+# overrides the preset's defaults field-by-field, so an operator can
+# (e.g.) pick ``audit.mode: fast`` and still set
+# ``audit.replication.analyzer: 3`` directly.
+_MODE_PRESETS: dict[str, dict[str, Any]] = {
+    "fast": {
+        "replication": {"analyzer": 1, "validator": 1, "exploiter": 1},
+        "validator": {
+            "debate": {
+                "enabled": False,
+                "max_rounds": 5,
+                "halt_on_consensus": True,
+            }
+        },
+        "max_findings_per_unit": 3,
+    },
+    "deep": {
+        "replication": {"analyzer": 3, "validator": 3, "exploiter": 1},
+        "validator": {
+            "debate": {
+                "enabled": True,
+                "max_rounds": 2,
+                "halt_on_consensus": True,
+            }
+        },
+        "max_findings_per_unit": 3,
+    },
+}
+
+
+def _build_audit_mode_config(
+    data: Mapping[str, Any],
+    llm_settings: LLMSettings | None = None,
+) -> AuditModeConfig:
+    """Parse ``audit.mode`` + replication / debate / cap fields.
+
+    Reads directly from ``data["audit"]`` because the new shape lives
+    under the same yaml namespace as the existing ``audit.*`` knobs
+    (``worker_count``, ``shutdown_timeout_seconds``, etc.). The legacy
+    ``teaming.*`` migration has already populated these keys when the
+    operator's yaml uses the old shape — see
+    ``_migrate_legacy_teaming``.
+    """
+
+    audit_raw = data.get("audit") or {}
+    if not isinstance(audit_raw, Mapping):
+        raise ConfigError("Invalid audit configuration; expected a mapping.")
+
+    mode_raw = audit_raw.get("mode", "fast")
+    mode = str(mode_raw).strip().lower()
+    if mode not in AUDIT_MODE_VALUES:
+        raise ConfigError(
+            f"Invalid audit.mode value `{mode_raw}`; "
+            f"expected one of: {', '.join(AUDIT_MODE_VALUES)}."
+        )
+
+    preset = _MODE_PRESETS[mode]
+
+    replication_raw = audit_raw.get("replication") or {}
+    if not isinstance(replication_raw, Mapping):
+        raise ConfigError("Invalid audit.replication configuration; expected a mapping.")
+    replication = AuditReplicationConfig(
+        analyzer=_normalize_bounded_int(
+            replication_raw.get("analyzer", preset["replication"]["analyzer"]),
+            field_name="audit.replication.analyzer",
+            minimum=1,
+            maximum=20,
+        ),
+        validator=_normalize_bounded_int(
+            replication_raw.get("validator", preset["replication"]["validator"]),
+            field_name="audit.replication.validator",
+            minimum=1,
+            maximum=20,
+        ),
+        exploiter=_normalize_bounded_int(
+            replication_raw.get("exploiter", preset["replication"]["exploiter"]),
+            field_name="audit.replication.exploiter",
+            minimum=1,
+            maximum=20,
+        ),
+    )
+
+    analyzer_raw = audit_raw.get("analyzer") or {}
+    if not isinstance(analyzer_raw, Mapping):
+        raise ConfigError("Invalid audit.analyzer configuration; expected a mapping.")
+    analyzer_stage = AuditAnalyzerStageConfig(
+        provider_list=_normalize_provider_list(
+            analyzer_raw.get("provider_list", ()),
+            field_name="audit.analyzer.provider_list",
+        ),
+    )
+
+    validator_raw = audit_raw.get("validator") or {}
+    if not isinstance(validator_raw, Mapping):
+        raise ConfigError("Invalid audit.validator configuration; expected a mapping.")
+    debate_raw = validator_raw.get("debate") or {}
+    if not isinstance(debate_raw, Mapping):
+        raise ConfigError("Invalid audit.validator.debate configuration; expected a mapping.")
+    validator_debate = ValidatorDebateConfig(
+        enabled=_normalize_bool(
+            debate_raw.get("enabled", preset["validator"]["debate"]["enabled"]),
+            field_name="audit.validator.debate.enabled",
+        ),
+        max_rounds=_normalize_bounded_int(
+            debate_raw.get("max_rounds", preset["validator"]["debate"]["max_rounds"]),
+            field_name="audit.validator.debate.max_rounds",
+            minimum=1,
+            maximum=20,
+        ),
+        halt_on_consensus=_normalize_bool(
+            debate_raw.get(
+                "halt_on_consensus",
+                preset["validator"]["debate"]["halt_on_consensus"],
+            ),
+            field_name="audit.validator.debate.halt_on_consensus",
+        ),
+    )
+    validator_stage = AuditValidatorStageConfig(
+        provider_list=_normalize_provider_list(
+            validator_raw.get("provider_list", ()),
+            field_name="audit.validator.provider_list",
+        ),
+        debate=validator_debate,
+    )
+
+    exploiter_raw = audit_raw.get("exploiter") or {}
+    if not isinstance(exploiter_raw, Mapping):
+        raise ConfigError("Invalid audit.exploiter configuration; expected a mapping.")
+    exploiter_stage = AuditExploiterStageConfig(
+        provider_list=_normalize_provider_list(
+            exploiter_raw.get("provider_list", ()),
+            field_name="audit.exploiter.provider_list",
+        ),
+    )
+
+    max_findings = _normalize_bounded_int(
+        audit_raw.get("max_findings_per_unit", preset["max_findings_per_unit"]),
+        field_name="audit.max_findings_per_unit",
+        minimum=1,
+        maximum=20,
+    )
+
+    experimental_raw = audit_raw.get("experimental") or {}
+    if not isinstance(experimental_raw, Mapping):
+        raise ConfigError(
+            "Invalid audit.experimental configuration; expected a mapping."
+        )
+    experimental = AuditExperimentalConfig(
+        units=_normalize_bool(
+            experimental_raw.get("units", False),
+            field_name="audit.experimental.units",
+        ),
+    )
+
+    # graph_slice was promoted from audit.experimental.graph_slice to
+    # top-level audit.graph_slice (default true). Legacy path is
+    # accepted with a deprecation warning for one minor release.
+    if "graph_slice" in audit_raw:
+        graph_slice_value = _normalize_bool(
+            audit_raw["graph_slice"],
+            field_name="audit.graph_slice",
+        )
+    elif "graph_slice" in experimental_raw:
+        warnings.warn(
+            "Deprecated audit.experimental.graph_slice: graph_slice is "
+            "no longer experimental and lives at audit.graph_slice "
+            "(default true). The legacy path is removed in the next "
+            "minor release.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        graph_slice_value = _normalize_bool(
+            experimental_raw["graph_slice"],
+            field_name="audit.experimental.graph_slice",
+        )
+    else:
+        graph_slice_value = True  # new default
+
+    stages_raw = audit_raw.get("stages") or {}
+    if not isinstance(stages_raw, Mapping):
+        raise ConfigError(
+            "Invalid audit.stages configuration; expected a mapping."
+        )
+    stages_form = str(stages_raw.get("form", "prompt")).strip().lower()
+    if stages_form not in AUDIT_STAGES_FORM_VALUES:
+        raise ConfigError(
+            f"Invalid audit.stages.form value `{stages_form}`; "
+            f"expected one of: {', '.join(AUDIT_STAGES_FORM_VALUES)}."
+        )
+
+    personas_raw = audit_raw.get("personas") or ()
+    if not isinstance(personas_raw, (list, tuple)):
+        raise ConfigError(
+            "Invalid audit.personas configuration; expected a list."
+        )
+    personas: list[AuditPersonaConfig] = []
+    for index, item in enumerate(personas_raw):
+        if not isinstance(item, Mapping):
+            raise ConfigError(
+                f"Invalid audit.personas[{index}]; expected a mapping."
+            )
+        name = str(item.get("name", "")).strip()
+        if not name:
+            raise ConfigError(
+                f"audit.personas[{index}].name is required and non-empty."
+            )
+        tool_emphasis_raw = item.get("tool_emphasis", ())
+        if isinstance(tool_emphasis_raw, str):
+            tool_emphasis = tuple(
+                t.strip() for t in tool_emphasis_raw.split(",") if t.strip()
+            )
+        else:
+            tool_emphasis = tuple(str(t) for t in (tool_emphasis_raw or ()))
+        personas.append(
+            AuditPersonaConfig(
+                name=name,
+                focus_summary=str(item.get("focus_summary", "")),
+                extra_system_prefix=str(item.get("extra_system_prefix", "")),
+                tool_emphasis=tool_emphasis,
+            )
+        )
+
+    coverage_gaps_raw = audit_raw.get("coverage_gaps") or {}
+    if not isinstance(coverage_gaps_raw, Mapping):
+        raise ConfigError(
+            "Invalid audit.coverage_gaps configuration; expected a mapping."
+        )
+    coverage_gaps_report = _normalize_bool(
+        coverage_gaps_raw.get("report", True),
+        field_name="audit.coverage_gaps.report",
+    )
+
+    agentic_raw = audit_raw.get("agentic") or {}
+    if not isinstance(agentic_raw, Mapping):
+        raise ConfigError(
+            "Invalid audit.agentic configuration; expected a mapping."
+        )
+    agentic_transport_raw = agentic_raw.get("transport") or {}
+    if not isinstance(agentic_transport_raw, Mapping):
+        raise ConfigError(
+            "Invalid audit.agentic.transport configuration; expected a mapping."
+        )
+    transport_kind = str(agentic_transport_raw.get("kind", "coder_service")).strip().lower()
+    if transport_kind not in _AGENTIC_TRANSPORT_KINDS:
+        raise ConfigError(
+            f"Invalid audit.agentic.transport.kind value `{transport_kind}`; "
+            f"expected one of: {', '.join(_AGENTIC_TRANSPORT_KINDS)}."
+        )
+    coder_service_raw = agentic_transport_raw.get("coder_service") or {}
+    if not isinstance(coder_service_raw, Mapping):
+        raise ConfigError(
+            "Invalid audit.agentic.transport.coder_service configuration; "
+            "expected a mapping."
+        )
+    coder_service_cfg = AuditAgenticTransportCoderServiceConfig(
+        endpoint=str(
+            coder_service_raw.get("endpoint", "http://127.0.0.1:8090")
+        ).strip(),
+        bearer_token_env=str(
+            coder_service_raw.get("bearer_token_env", "")
+        ).strip(),
+        request_timeout_safety_seconds=_normalize_bounded_int(
+            coder_service_raw.get("request_timeout_safety_seconds", 60),
+            field_name="audit.agentic.transport.coder_service.request_timeout_safety_seconds",
+            minimum=0,
+            maximum=600,
+        ),
+        project=str(coder_service_raw.get("project", "")).strip(),
+    )
+    agentic = AuditAgenticConfig(
+        timeout_seconds=_normalize_bounded_int(
+            agentic_raw.get("timeout_seconds", 300),
+            field_name="audit.agentic.timeout_seconds",
+            minimum=10,
+            maximum=1800,
+        ),
+        transport=AuditAgenticTransportConfig(
+            kind=transport_kind,
+            coder_service=coder_service_cfg,
+        ),
+    )
+
+    # Validate provider names against the configured llm.providers.
+    # Mirrors the legacy `_build_teaming_config` validation; matters now
+    # that workflow.py reads provider_list from `audit.<stage>` directly
+    # (Phase 1B) instead of through TeamingConfig's validated path.
+    if llm_settings is not None:
+        available = ", ".join(sorted(llm_settings.providers)) or "none"
+        for stage_name, providers in (
+            ("analyzer", analyzer_stage.provider_list),
+            ("validator", validator_stage.provider_list),
+            ("exploiter", exploiter_stage.provider_list),
+        ):
+            for provider_name in providers:
+                if provider_name not in llm_settings.providers:
+                    raise ConfigError(
+                        f"Unknown provider `{provider_name}` in "
+                        f"audit.{stage_name}.provider_list. "
+                        f"Available configured providers: {available}"
+                    )
+
+    return AuditModeConfig(
+        mode=mode,
+        replication=replication,
+        analyzer=analyzer_stage,
+        validator=validator_stage,
+        exploiter=exploiter_stage,
+        max_findings_per_unit=max_findings,
+        graph_slice=graph_slice_value,
+        experimental=experimental,
+        stages_form=stages_form,
+        personas=tuple(personas),
+        coverage_gaps_report=coverage_gaps_report,
+        agentic=agentic,
+    )
+
+
+def _migrate_legacy_teaming(data: dict[str, Any]) -> None:
+    """Translate legacy ``teaming.*`` yaml into the new ``audit.*`` shape.
+
+    Mutates ``data["audit"]`` in place, populating any new-shape keys
+    that aren't already set by the operator. Emits one
+    ``DeprecationWarning`` per legacy field encountered, naming the
+    new dot-path it maps to.
+
+    Mapping table:
+        teaming.enabled                            -> audit.mode
+            (true → "deep", false/unset → "fast")
+        teaming.analyzer.subagent_count            -> audit.replication.analyzer
+        teaming.validator.subagent_count           -> audit.replication.validator
+        teaming.exploiter.subagent_count           -> audit.replication.exploiter
+        teaming.validator.debate_rounds            -> audit.validator.debate.max_rounds
+            (also sets audit.validator.debate.enabled = true)
+        teaming.analyzer.provider_list             -> audit.analyzer.provider_list
+        teaming.validator.provider_list            -> audit.validator.provider_list
+        teaming.exploiter.provider_list            -> audit.exploiter.provider_list
+
+    Phase 1B finished the provider_list migration: the workflow now
+    reads from `audit.<stage>.provider_list` exclusively. The legacy
+    `teaming.<stage>.provider_list` keys still parse and migrate here
+    with a deprecation warning for one minor release, then disappear
+    in a follow-up cleanup change.
+
+    When ``audit.mode`` (or `audit.<stage>.provider_list`) is already
+    set on the new shape, the legacy values for that key are NOT
+    overwritten and NO warning fires for that key — operators
+    mid-migration who write both shapes get the new shape's behavior
+    silently (loud warnings during a deliberate dual-write are noise).
+    """
+
+    teaming_raw = data.get("teaming") or {}
+    if not isinstance(teaming_raw, Mapping):
+        return  # _build_teaming_config will raise the proper error
+    if not teaming_raw:
+        return
+
+    audit_raw = data.setdefault("audit", {})
+    if not isinstance(audit_raw, dict):
+        return
+
+    audit_mode_set = "mode" in audit_raw
+    notices: list[str] = []
+
+    # teaming.enabled → audit.mode
+    if "enabled" in teaming_raw and not audit_mode_set:
+        try:
+            enabled = _normalize_bool(teaming_raw["enabled"], field_name="teaming.enabled")
+        except ConfigError:
+            enabled = False
+        audit_raw["mode"] = "deep" if enabled else "fast"
+        notices.append(
+            "teaming.enabled → audit.mode "
+            f"({'deep' if enabled else 'fast'})"
+        )
+
+    analyzer_raw = teaming_raw.get("analyzer") or {}
+    validator_raw = teaming_raw.get("validator") or {}
+    exploiter_raw = teaming_raw.get("exploiter") or {}
+
+    replication = audit_raw.setdefault("replication", {})
+    if isinstance(replication, dict):
+        if "subagent_count" in (analyzer_raw or {}) and "analyzer" not in replication:
+            replication["analyzer"] = analyzer_raw["subagent_count"]
+            notices.append(
+                "teaming.analyzer.subagent_count → audit.replication.analyzer"
+            )
+        if "subagent_count" in (validator_raw or {}) and "validator" not in replication:
+            replication["validator"] = validator_raw["subagent_count"]
+            notices.append(
+                "teaming.validator.subagent_count → audit.replication.validator"
+            )
+        if "subagent_count" in (exploiter_raw or {}) and "exploiter" not in replication:
+            replication["exploiter"] = exploiter_raw["subagent_count"]
+            notices.append(
+                "teaming.exploiter.subagent_count → audit.replication.exploiter"
+            )
+
+    validator_block = audit_raw.setdefault("validator", {})
+    if isinstance(validator_block, dict):
+        debate_block = validator_block.setdefault("debate", {})
+        if isinstance(debate_block, dict):
+            if "debate_rounds" in (validator_raw or {}):
+                if "max_rounds" not in debate_block:
+                    debate_block["max_rounds"] = validator_raw["debate_rounds"]
+                    notices.append(
+                        "teaming.validator.debate_rounds → "
+                        "audit.validator.debate.max_rounds"
+                    )
+                if "enabled" not in debate_block:
+                    # Setting `debate_rounds` historically implied
+                    # debate-on; mirror that under the new shape.
+                    debate_block["enabled"] = True
+                    notices.append(
+                        "teaming.validator.debate_rounds (implies "
+                        "audit.validator.debate.enabled = true)"
+                    )
+
+    # Provider-list migration (Phase 1B): teaming.<stage>.provider_list
+    # → audit.<stage>.provider_list. Each migrated key fires one
+    # DeprecationWarning. When the new shape is already set for a
+    # given stage, the legacy value is silently ignored for that stage
+    # (no warning — operator is mid-migration).
+    for stage_name, legacy_stage_raw in (
+        ("analyzer", analyzer_raw),
+        ("validator", validator_raw),
+        ("exploiter", exploiter_raw),
+    ):
+        if not isinstance(legacy_stage_raw, Mapping):
+            continue
+        if "provider_list" not in legacy_stage_raw:
+            continue
+        new_stage_block = audit_raw.setdefault(stage_name, {})
+        if not isinstance(new_stage_block, dict):
+            continue
+        if "provider_list" in new_stage_block:
+            # Operator wrote both shapes for this stage — new shape
+            # wins, no warning fires (deliberate dual-write).
+            continue
+        new_stage_block["provider_list"] = legacy_stage_raw["provider_list"]
+        notices.append(
+            f"teaming.{stage_name}.provider_list → "
+            f"audit.{stage_name}.provider_list"
+        )
+
+    if notices:
+        import warnings as _warnings
+
+        for notice in notices:
+            _warnings.warn(
+                f"Deprecated teaming.* config: {notice}. "
+                "Use the new `audit.*` shape directly; the legacy "
+                "shim is removed in the next minor release.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
 
 
 _ONE_SHOT_WARNED: set[str] = set()
@@ -1345,12 +2121,34 @@ def _env_to_mapping(env: Mapping[str, str]) -> dict[str, Any]:
             value = _normalize_bool(value, field_name="coder.enable_auth")
         elif dot_path == "coder.cli_command":
             value = _parse_coder_cli_command_env(value)
+        elif dot_path == "audit.validator.debate.enabled":
+            value = _normalize_bool(value, field_name="audit.validator.debate.enabled")
+        elif dot_path == "audit.validator.debate.halt_on_consensus":
+            value = _normalize_bool(value, field_name="audit.validator.debate.halt_on_consensus")
+        elif dot_path == "audit.graph_slice":
+            value = _normalize_bool(value, field_name="audit.graph_slice")
+        elif dot_path == "audit.experimental.graph_slice":
+            value = _normalize_bool(value, field_name="audit.experimental.graph_slice")
+        elif dot_path == "audit.experimental.units":
+            value = _normalize_bool(value, field_name="audit.experimental.units")
+        elif dot_path == "audit.coverage_gaps.report":
+            value = _normalize_bool(value, field_name="audit.coverage_gaps.report")
+        elif dot_path in (
+            "audit.agentic.timeout_seconds",
+            "audit.agentic.transport.coder_service.request_timeout_safety_seconds",
+        ):
+            value = _normalize_positive_int(value, field_name=dot_path)
         elif dot_path in (
             "coder.concurrency",
             "coder.request_timeout_seconds",
             "coder.preflight_timeout_seconds",
             "audit.shutdown_timeout_seconds",
             "audit.coder.shutdown_timeout_seconds",
+            "audit.replication.analyzer",
+            "audit.replication.validator",
+            "audit.replication.exploiter",
+            "audit.validator.debate.max_rounds",
+            "audit.max_findings_per_unit",
         ):
             value = _normalize_positive_int(value, field_name=dot_path)
         elif dot_path == "coder.poll_interval_seconds":
