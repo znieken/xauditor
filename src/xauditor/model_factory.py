@@ -101,8 +101,22 @@ except ImportError:  # pragma: no cover - optional dependency
 # ``thinking_enabled: true`` is set on the yaml. Sized so non-trivial
 # multi-finding paths can reason without burning unbounded tokens; can
 # be exposed as a configurable field if operators need finer control.
-_ANTHROPIC_DEFAULT_THINKING_BUDGET_TOKENS = 8192
-_ANTHROPIC_THINKING_MAX_TOKENS_FLOOR = 16384
+# Token budgets for Anthropic providers are pinned to "effectively
+# unlimited" values matching the largest-context Claude variants
+# (~1M total, ~200K reasoning). The Anthropic API REQUIRES
+# `max_tokens` (and, on the legacy `thinking={...}` branch,
+# `budget_tokens` too) — passing nothing would let
+# langchain-anthropic 1.4.x's `set_default_max_tokens` validator
+# fall back to 4096 when the model has no registered profile (e.g.
+# preview / private Claude models like `claude-mythos-preview`),
+# which extended thinking immediately consumes, leaving the
+# response with only `type:"thinking"` parts and an empty
+# `type:"text"` block (downstream `invoke_json` then blows up on
+# `json.loads("")`). Pinning a generous floor lets the model — not
+# our code — be the budget arbiter.
+_ANTHROPIC_DEFAULT_THINKING_BUDGET_TOKENS = 200_000
+_ANTHROPIC_THINKING_MAX_TOKENS_FLOOR = 1_000_000
+_ANTHROPIC_EFFORT_MAX_TOKENS_FLOOR = 1_000_000
 
 
 @dataclass(frozen=True)
@@ -512,6 +526,7 @@ class AnthropicLangChainChatModel:
         # Operators who set BOTH get the new ``effort`` path (it wins).
         if self.thinking_effort is not None:
             kwargs["effort"] = self.thinking_effort
+            kwargs["max_tokens"] = _ANTHROPIC_EFFORT_MAX_TOKENS_FLOOR
         elif self.thinking_enabled:
             if not self._warned_thinking_legacy:
                 log.warning(

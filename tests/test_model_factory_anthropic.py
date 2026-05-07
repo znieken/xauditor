@@ -185,6 +185,25 @@ class AnthropicChatModelKwargsTests(unittest.TestCase):
         self.assertEqual(captured.get("effort"), "high")
         self.assertNotIn("thinking", captured)
 
+    def test_thinking_effort_pins_max_tokens_floor(self) -> None:
+        # Regression: without an explicit max_tokens, langchain-anthropic
+        # 1.4.x falls back to 4096 for models without a profile entry
+        # (e.g. preview models like `claude-mythos-preview`). Under
+        # extended thinking that 4K gets fully consumed by reasoning,
+        # the response carries only `type:"thinking"` parts, and
+        # downstream `invoke_json` blows up on `json.loads("")`. The
+        # effort branch MUST pin a generous max_tokens floor.
+        from xauditor.model_factory import _ANTHROPIC_EFFORT_MAX_TOKENS_FLOOR
+
+        captured = self._build_chat_capturing_kwargs(
+            sampling=SamplingParams(),
+            thinking_enabled=False,
+            thinking_effort="high",
+        )
+        self.assertEqual(
+            captured.get("max_tokens"), _ANTHROPIC_EFFORT_MAX_TOKENS_FLOOR
+        )
+
     def test_thinking_effort_takes_precedence_over_thinking_enabled(self) -> None:
         # When BOTH are set, thinking_effort wins (it's the
         # forward-compatible API surface) — and no deprecation warning.
