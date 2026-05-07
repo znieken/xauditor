@@ -334,6 +334,23 @@ class LLMConfig:
     # ``ChatAnthropic(default_request_timeout=...)`` for
     # ``kind: anthropic``.
     request_timeout_seconds: float | None = None
+    # Hard ceiling sent to ChatAnthropic as ``max_tokens=`` on
+    # ``kind: anthropic`` providers. ``None`` falls back to
+    # ``_ANTHROPIC_DEFAULT_MAX_TOKENS`` (64K). Operators on
+    # 1M-context Claude variants should override upward; operators
+    # on preview models with smaller output ceilings (e.g.
+    # ``claude-mythos-preview`` at 128K) should clamp this to the
+    # model's documented limit. Currently only consumed by the
+    # Anthropic wire path; ignored on ``kind: openai`` (the OpenAI
+    # SDK's own default applies).
+    max_tokens: int | None = None
+    # Extended-thinking budget for the legacy ``thinking_enabled:
+    # true`` shape on ``kind: anthropic``. Ignored on ``kind: openai``
+    # and on the new ``thinking_effort`` path. ``None`` falls back to
+    # ``_ANTHROPIC_DEFAULT_THINKING_BUDGET_TOKENS``. Anthropic
+    # requires ``max_tokens > thinking_budget_tokens``; operators are
+    # responsible for keeping the two consistent.
+    thinking_budget_tokens: int | None = None
     # Wire protocol the provider speaks. ``"openai"`` (default) uses
     # ``langchain_openai.ChatOpenAI`` against the configured
     # ``base_url`` — every existing yaml in the wild parses with this
@@ -357,6 +374,12 @@ class LLMConfig:
         if self.request_timeout_seconds is not None:
             parts.append(
                 f"request_timeout_seconds={self.request_timeout_seconds!r}"
+            )
+        if self.max_tokens is not None:
+            parts.append(f"max_tokens={self.max_tokens!r}")
+        if self.thinking_budget_tokens is not None:
+            parts.append(
+                f"thinking_budget_tokens={self.thinking_budget_tokens!r}"
             )
         for name in ("temperature", "top_p", "top_k", "repetition_penalty"):
             value = getattr(self, name)
@@ -818,6 +841,8 @@ ENV_KEY_MAP = {
     "XAUDITOR_LLM_MODEL_NAME": "llm.model_name",
     "XAUDITOR_LLM_THINKING_ENABLED": "llm.thinking_enabled",
     "XAUDITOR_LLM_REQUEST_TIMEOUT_SECONDS": "llm.request_timeout_seconds",
+    "XAUDITOR_LLM_MAX_TOKENS": "llm.max_tokens",
+    "XAUDITOR_LLM_THINKING_BUDGET_TOKENS": "llm.thinking_budget_tokens",
     "XAUDITOR_AUDIT_WORKER_COUNT": "audit.worker_count",
     "XAUDITOR_AUDIT_SHUTDOWN_TIMEOUT_SECONDS": "audit.shutdown_timeout_seconds",
     "XAUDITOR_AUDIT_CODER_SHUTDOWN_TIMEOUT_SECONDS": "audit.coder.shutdown_timeout_seconds",
@@ -2263,6 +2288,8 @@ def _build_llm_settings(data: Mapping[str, Any]) -> LLMSettings:
         "model_name",
         "thinking_enabled",
         "request_timeout_seconds",
+        "max_tokens",
+        "thinking_budget_tokens",
     ):
         if field_name in llm_data:
             legacy_fields[field_name] = llm_data[field_name]
@@ -2310,6 +2337,14 @@ def _build_llm_settings(data: Mapping[str, Any]) -> LLMSettings:
             provider_data.get("request_timeout_seconds"),
             dot_path=f"llm.providers.{provider_name}.request_timeout_seconds",
         )
+        max_tokens = _normalize_positive_int_optional(
+            provider_data.get("max_tokens"),
+            dot_path=f"llm.providers.{provider_name}.max_tokens",
+        )
+        thinking_budget_tokens = _normalize_positive_int_optional(
+            provider_data.get("thinking_budget_tokens"),
+            dot_path=f"llm.providers.{provider_name}.thinking_budget_tokens",
+        )
         providers[provider_name] = LLMConfig(
             base_url=str(provider_data.get("base_url", "")).strip(),
             api_key=str(provider_data.get("api_key", "")).strip(),
@@ -2320,6 +2355,8 @@ def _build_llm_settings(data: Mapping[str, Any]) -> LLMSettings:
             ),
             thinking_effort=thinking_effort,
             request_timeout_seconds=request_timeout_seconds,
+            max_tokens=max_tokens,
+            thinking_budget_tokens=thinking_budget_tokens,
             kind=kind,
             **sampling_kwargs,
         )
@@ -2413,6 +2450,40 @@ def _normalize_sampling_value(
 
 
 _SAMPLING_FIELDS: tuple[str, ...] = ("temperature", "top_p", "top_k", "repetition_penalty")
+
+
+def _normalize_positive_int_optional(value: Any, *, dot_path: str) -> int | None:
+    """Coerce a yaml value to ``int | None`` and reject non-positive integers.
+
+    Returns ``None`` when the field is omitted or explicitly null/empty
+    string. Raises :class:`ConfigError` on ``0``, negatives, booleans,
+    or anything that does not parse as a positive integer. Used by the
+    ``llm.providers.<name>.{max_tokens, thinking_budget_tokens}``
+    fields.
+    """
+
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ConfigError(
+            f"Invalid {dot_path} value `{value}`; expected a positive integer."
+        )
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return None
+        value = stripped
+    try:
+        number = int(value) if not isinstance(value, int) else value
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(
+            f"Invalid {dot_path} value `{value}`; expected a positive integer."
+        ) from exc
+    if number <= 0:
+        raise ConfigError(
+            f"Invalid {dot_path} value `{value}`; expected a positive integer."
+        )
+    return number
 
 
 def _normalize_positive_float_optional(value: Any, *, dot_path: str) -> float | None:

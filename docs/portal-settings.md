@@ -81,6 +81,8 @@ also names the key.
 | LLM providers | `llm.providers.<name>.thinking_enabled` | boolean | — |
 | LLM providers | `llm.providers.<name>.thinking_effort` | enum or `(unset)` | `low \| medium \| high \| xhigh \| max` |
 | LLM providers | `llm.providers.<name>.request_timeout_seconds` | float | `> 0` |
+| LLM providers | `llm.providers.<name>.max_tokens` | integer or `(unset)` | `> 0`; defaults to 64000 on `kind: anthropic` |
+| LLM providers | `llm.providers.<name>.thinking_budget_tokens` | integer or `(unset)` | `> 0`; defaults to 32000 on `kind: anthropic` legacy thinking branch |
 | LLM providers | `llm.providers.<name>.{temperature, top_p, top_k, repetition_penalty}` | number | sampling rules |
 | Default provider | `llm.default_provider` | enum | one of the configured providers |
 | Per-agent overrides | `agents.<agent>.llm.provider` | enum | one of the configured providers |

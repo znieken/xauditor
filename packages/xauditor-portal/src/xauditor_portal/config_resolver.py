@@ -26,7 +26,8 @@ The set of keys editable from the portal UI is intentionally narrow:
   `coder.repo_mount_path` not exposed)
 - `llm.default_provider`, `llm.providers.<name>.{base_url,model_name,
   kind,thinking_enabled,thinking_effort,request_timeout_seconds,
-  temperature,top_p,top_k,repetition_penalty}`
+  max_tokens,thinking_budget_tokens,temperature,top_p,top_k,
+  repetition_penalty}`
 - `agents.<name>.llm.{provider,thinking_enabled,
   request_timeout_seconds,temperature,top_p,top_k,repetition_penalty}`
 

@@ -97,6 +97,8 @@ llm:
       # repetition_penalty: 1.05
       # request_timeout_seconds: 1800
       # thinking_effort: high              # only honored on `kind: anthropic`
+      # max_tokens: 64000                  # default 64000; clamp to the model's output ceiling
+      # thinking_budget_tokens: 32000      # legacy `thinking_enabled: true` reasoning budget
     coder-next:
       base_url: https://....
       api_key: sk-...

@@ -97,26 +97,27 @@ except ImportError:  # pragma: no cover - optional dependency
     LANGCHAIN_ANTHROPIC_AVAILABLE = False
 
 
-# Default extended-thinking budget on the Anthropic provider when
-# ``thinking_enabled: true`` is set on the yaml. Sized so non-trivial
-# multi-finding paths can reason without burning unbounded tokens; can
-# be exposed as a configurable field if operators need finer control.
-# Token budgets for Anthropic providers are pinned to "effectively
-# unlimited" values matching the largest-context Claude variants
-# (~1M total, ~200K reasoning). The Anthropic API REQUIRES
-# `max_tokens` (and, on the legacy `thinking={...}` branch,
-# `budget_tokens` too) — passing nothing would let
-# langchain-anthropic 1.4.x's `set_default_max_tokens` validator
+# Defaults for the Anthropic provider's ``max_tokens`` and (on the
+# legacy ``thinking_enabled: true`` branch) ``thinking.budget_tokens``.
+# Both are exposed as ``llm.providers.<name>.{max_tokens,
+# thinking_budget_tokens}`` yaml fields so operators can size them to
+# the target model's actual ceiling.
+#
+# 64K fits within every currently-shipping Claude variant we target,
+# including preview/private models with smaller output ceilings (e.g.
+# ``claude-mythos-preview`` caps at 128K output). Operators on
+# larger-context models (Sonnet/Opus 1M-context) should override
+# upward in their yaml.
+#
+# Why we always send ``max_tokens``: passing nothing would let
+# langchain-anthropic 1.4.x's ``set_default_max_tokens`` validator
 # fall back to 4096 when the model has no registered profile (e.g.
-# preview / private Claude models like `claude-mythos-preview`),
-# which extended thinking immediately consumes, leaving the
-# response with only `type:"thinking"` parts and an empty
-# `type:"text"` block (downstream `invoke_json` then blows up on
-# `json.loads("")`). Pinning a generous floor lets the model — not
-# our code — be the budget arbiter.
-_ANTHROPIC_DEFAULT_THINKING_BUDGET_TOKENS = 200_000
-_ANTHROPIC_THINKING_MAX_TOKENS_FLOOR = 1_000_000
-_ANTHROPIC_EFFORT_MAX_TOKENS_FLOOR = 1_000_000
+# preview / private Claude models), which extended thinking
+# immediately consumes, leaving the response with only
+# ``type:"thinking"`` parts and an empty ``type:"text"`` block
+# (downstream ``invoke_json`` then blows up on ``json.loads("")``).
+_ANTHROPIC_DEFAULT_MAX_TOKENS = 64_000
+_ANTHROPIC_DEFAULT_THINKING_BUDGET_TOKENS = 32_000
 
 
 @dataclass(frozen=True)
@@ -452,6 +453,11 @@ class AnthropicLangChainChatModel:
     thinking_enabled: bool
     sampling: SamplingParams = field(default_factory=SamplingParams)
     is_mock: bool = False
+    # Hard ceiling sent to ChatAnthropic as ``max_tokens=``. Required
+    # by the Anthropic SDK (see module-level comment). Sized to fit
+    # every currently-shipping Claude output ceiling; operators on
+    # 1M-context Sonnet/Opus should override upward via the yaml.
+    max_tokens: int = _ANTHROPIC_DEFAULT_MAX_TOKENS
     thinking_budget_tokens: int = _ANTHROPIC_DEFAULT_THINKING_BUDGET_TOKENS
     # Discrete extended-thinking dial. ``"low" | "medium" | "high" |
     # "xhigh" | "max"``. ``None`` means "fall back to thinking_enabled
@@ -526,7 +532,7 @@ class AnthropicLangChainChatModel:
         # Operators who set BOTH get the new ``effort`` path (it wins).
         if self.thinking_effort is not None:
             kwargs["effort"] = self.thinking_effort
-            kwargs["max_tokens"] = _ANTHROPIC_EFFORT_MAX_TOKENS_FLOOR
+            kwargs["max_tokens"] = self.max_tokens
         elif self.thinking_enabled:
             if not self._warned_thinking_legacy:
                 log.warning(
@@ -545,11 +551,10 @@ class AnthropicLangChainChatModel:
                 "budget_tokens": self.thinking_budget_tokens,
             }
             # ``max_tokens`` is required by the Anthropic SDK whenever
-            # ``thinking`` is on, and must be greater than the budget.
-            kwargs["max_tokens"] = max(
-                _ANTHROPIC_THINKING_MAX_TOKENS_FLOOR,
-                self.thinking_budget_tokens * 2,
-            )
+            # ``thinking`` is on, and the API rejects requests where
+            # ``max_tokens <= budget_tokens``. Operators are responsible
+            # for keeping the two consistent in their yaml.
+            kwargs["max_tokens"] = self.max_tokens
         if self.request_timeout_seconds is not None:
             # ChatAnthropic exposes the timeout as
             # ``default_request_timeout``; keeping the kwarg name
@@ -660,16 +665,21 @@ def build_chat_model(
             sampling=resolved_sampling,
         )
     if provider.kind == PROVIDER_KIND_ANTHROPIC:
-        return AnthropicLangChainChatModel(
-            provider_name=provider_name,
-            model_name=provider.model_name,
-            base_url=provider.base_url,
-            api_key=provider.api_key,
-            thinking_enabled=provider.thinking_enabled,
-            thinking_effort=provider.thinking_effort,
-            sampling=resolved_sampling,
-            request_timeout_seconds=request_timeout_seconds,
-        )
+        anthropic_kwargs: dict[str, Any] = {
+            "provider_name": provider_name,
+            "model_name": provider.model_name,
+            "base_url": provider.base_url,
+            "api_key": provider.api_key,
+            "thinking_enabled": provider.thinking_enabled,
+            "thinking_effort": provider.thinking_effort,
+            "sampling": resolved_sampling,
+            "request_timeout_seconds": request_timeout_seconds,
+        }
+        if provider.max_tokens is not None:
+            anthropic_kwargs["max_tokens"] = provider.max_tokens
+        if provider.thinking_budget_tokens is not None:
+            anthropic_kwargs["thinking_budget_tokens"] = provider.thinking_budget_tokens
+        return AnthropicLangChainChatModel(**anthropic_kwargs)
     return LangChainChatModel(
         provider_name=provider_name,
         model_name=provider.model_name,

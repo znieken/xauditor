@@ -185,15 +185,17 @@ class AnthropicChatModelKwargsTests(unittest.TestCase):
         self.assertEqual(captured.get("effort"), "high")
         self.assertNotIn("thinking", captured)
 
-    def test_thinking_effort_pins_max_tokens_floor(self) -> None:
+    def test_thinking_effort_pins_max_tokens_default(self) -> None:
         # Regression: without an explicit max_tokens, langchain-anthropic
         # 1.4.x falls back to 4096 for models without a profile entry
         # (e.g. preview models like `claude-mythos-preview`). Under
         # extended thinking that 4K gets fully consumed by reasoning,
         # the response carries only `type:"thinking"` parts, and
         # downstream `invoke_json` blows up on `json.loads("")`. The
-        # effort branch MUST pin a generous max_tokens floor.
-        from xauditor.model_factory import _ANTHROPIC_EFFORT_MAX_TOKENS_FLOOR
+        # effort branch MUST always pin max_tokens; default falls
+        # back to ``_ANTHROPIC_DEFAULT_MAX_TOKENS`` when the operator
+        # has not overridden ``llm.providers.<name>.max_tokens``.
+        from xauditor.model_factory import _ANTHROPIC_DEFAULT_MAX_TOKENS
 
         captured = self._build_chat_capturing_kwargs(
             sampling=SamplingParams(),
@@ -201,8 +203,66 @@ class AnthropicChatModelKwargsTests(unittest.TestCase):
             thinking_effort="high",
         )
         self.assertEqual(
-            captured.get("max_tokens"), _ANTHROPIC_EFFORT_MAX_TOKENS_FLOOR
+            captured.get("max_tokens"), _ANTHROPIC_DEFAULT_MAX_TOKENS
         )
+
+    def test_max_tokens_override_routes_to_kwarg(self) -> None:
+        # Operators on preview models with smaller output ceilings
+        # (e.g. ``claude-mythos-preview`` at 128K) must be able to
+        # clamp ``max_tokens`` below the default — otherwise the
+        # Anthropic API rejects the request with
+        # ``max_tokens: <N> > <model_limit>``.
+        captured: dict = {}
+
+        def _fake(**kwargs):
+            captured.update(kwargs)
+            return MagicMock(name="chat_anthropic")
+
+        with patch(
+            "xauditor.model_factory.ChatAnthropic", side_effect=_fake
+        ), patch("xauditor.model_factory.LANGCHAIN_ANTHROPIC_AVAILABLE", True):
+            model = AnthropicLangChainChatModel(
+                provider_name="p1",
+                model_name="claude-mythos-preview",
+                base_url="https://api.anthropic.com",
+                api_key="sk-ant-fake",
+                thinking_enabled=False,
+                thinking_effort="high",
+                sampling=SamplingParams(),
+                max_tokens=128_000,
+            )
+            model._chat()
+        self.assertEqual(captured.get("max_tokens"), 128_000)
+
+    def test_legacy_thinking_uses_configured_max_tokens_and_budget(self) -> None:
+        # Both ``max_tokens`` and ``thinking_budget_tokens`` are
+        # operator-configurable on the legacy ``thinking_enabled: true``
+        # branch; the chat model passes them through verbatim and does
+        # NOT auto-inflate ``max_tokens`` based on the budget. Operators
+        # are responsible for keeping ``max_tokens > thinking_budget_tokens``.
+        captured: dict = {}
+
+        def _fake(**kwargs):
+            captured.update(kwargs)
+            return MagicMock(name="chat_anthropic")
+
+        with patch(
+            "xauditor.model_factory.ChatAnthropic", side_effect=_fake
+        ), patch("xauditor.model_factory.LANGCHAIN_ANTHROPIC_AVAILABLE", True):
+            model = AnthropicLangChainChatModel(
+                provider_name="p1",
+                model_name="claude-sonnet-4-7",
+                base_url="https://api.anthropic.com",
+                api_key="sk-ant-fake",
+                thinking_enabled=True,
+                sampling=SamplingParams(),
+                max_tokens=100_000,
+                thinking_budget_tokens=40_000,
+            )
+            with self.assertLogs("xauditor.model_factory", level=logging.WARNING):
+                model._chat()
+        self.assertEqual(captured["max_tokens"], 100_000)
+        self.assertEqual(captured["thinking"]["budget_tokens"], 40_000)
 
     def test_thinking_effort_takes_precedence_over_thinking_enabled(self) -> None:
         # When BOTH are set, thinking_effort wins (it's the

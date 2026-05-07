@@ -65,6 +65,8 @@ extended thinking, sampling fields), see [Providers](providers.md).
 | `XAUDITOR_LLM_MODEL_NAME` | `llm.providers.<default>.model_name` |
 | `XAUDITOR_LLM_THINKING_ENABLED` | `llm.providers.<default>.thinking_enabled` |
 | `XAUDITOR_LLM_REQUEST_TIMEOUT_SECONDS` | `llm.request_timeout_seconds` |
+| `XAUDITOR_LLM_MAX_TOKENS` | `llm.max_tokens` (lands on the default provider) |
+| `XAUDITOR_LLM_THINKING_BUDGET_TOKENS` | `llm.thinking_budget_tokens` (lands on the default provider) |
 | `XAUDITOR_LLM_PROVIDERS_<PROVIDER>_{TEMPERATURE,TOP_P,TOP_K,REPETITION_PENALTY}` | per-provider sampling field |
 | `XAUDITOR_AGENTS_GRAPH_BUILDER_LLM_PROVIDER` | `agents.graph_builder.llm.provider` |
 | `XAUDITOR_AGENTS_AUDITOR_LLM_PROVIDER` | `agents.auditor.llm.provider` |

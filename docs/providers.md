@@ -46,6 +46,14 @@ llm:
       model_name: claude-sonnet-4-7
       thinking_effort: high                   # → ChatAnthropic(effort="high")
                                               #   one of: low | medium | high | xhigh | max
+      max_tokens: 64000                       # response ceiling sent as ChatAnthropic(max_tokens=)
+                                              #   default 64000; clamp to the model's actual
+                                              #   output limit (e.g. 128000 for
+                                              #   `claude-mythos-preview`, up to 1000000 for
+                                              #   1M-context Sonnet/Opus)
+      thinking_budget_tokens: 32000           # legacy `thinking_enabled: true` reasoning budget;
+                                              #   ignored on the `thinking_effort` path. Must be
+                                              #   strictly less than `max_tokens`.
       temperature: 0
       top_k: 64
       top_p: 0.95

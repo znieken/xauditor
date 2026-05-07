@@ -108,6 +108,8 @@ llm:
       # repetition_penalty: 1.05        # routes via extra_body; ignored by api.openai.com
       # request_timeout_seconds: 1800   # SDK default ~600s; raise for thinking_effort: max
       # thinking_enabled: false         # legacy; prefer thinking_effort on Anthropic kind
+      # max_tokens: 64000               # default 64000; clamp to the model's output ceiling
+      # thinking_budget_tokens: 32000   # legacy thinking_enabled budget; must be < max_tokens
 
     # Specialised OpenAI-compatible provider with extended thinking
     graph_specialist:
@@ -124,6 +126,8 @@ llm:
     #   model_name: claude-sonnet-4-7
     #   thinking_effort: high                 # low | medium | high | xhigh | max
     #   request_timeout_seconds: 1800
+    #   max_tokens: 128000                    # clamp to the model's actual output limit
+    #   thinking_budget_tokens: 32000         # legacy thinking_enabled budget (ignored under thinking_effort)
     #   temperature: 0
     #   top_k: 64
     #   top_p: 0.95

@@ -111,6 +111,8 @@ NUMERIC_RANGE_REGISTRY: dict[str, _NumericRule] = {
     "request_timeout_seconds": _NumericRule(
         0, None, kind="float", min_inclusive=False
     ),
+    "max_tokens": _NumericRule(1, None, kind="int"),
+    "thinking_budget_tokens": _NumericRule(1, None, kind="int"),
 }
 
 

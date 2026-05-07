@@ -115,7 +115,7 @@ override counts on its summary).
   fields auto-disable when transport / endpoint conditions don't match;
   deprecated `coder.repo_mount_path` is not exposed)
 - `llm.default_provider`
-- `llm.providers.<name>.{base_url, model_name, kind, thinking_enabled, thinking_effort, request_timeout_seconds, temperature, top_p, top_k, repetition_penalty}`
+- `llm.providers.<name>.{base_url, model_name, kind, thinking_enabled, thinking_effort, request_timeout_seconds, max_tokens, thinking_budget_tokens, temperature, top_p, top_k, repetition_penalty}`
 - `agents.<role>.llm.*` including `request_timeout_seconds`
 
 ### Secrets — yml-only, redacted at the API boundary
