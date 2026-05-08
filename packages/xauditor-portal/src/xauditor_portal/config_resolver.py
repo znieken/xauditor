@@ -9,7 +9,7 @@ The set of keys editable from the portal UI is intentionally narrow:
 - `repository.excludes`
 - `graph.build.*` (enable_llm_enrichment, max_file_bytes, paths_max_depth,
   paths_max_count, neo4j_chunk_size)
-- `audit.worker_count`
+- `audit.worker_count`, `audit.persist_false_positives`
 - `audit.mode`, `audit.replication.{analyzer,validator,exploiter}`,
   `audit.validator.debate.{enabled,max_rounds,halt_on_consensus}`,
   `audit.{analyzer,validator,exploiter}.provider_list`,

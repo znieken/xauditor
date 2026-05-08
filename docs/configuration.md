@@ -90,6 +90,8 @@ this table is the env-var → dot-path mapping.
 |---|---|
 | `XAUDITOR_AUDIT_MODE` | `audit.mode` (`fast` / `deep`) |
 | `XAUDITOR_AUDIT_WORKER_COUNT` | `audit.worker_count` (`[1, 16]`) |
+| `XAUDITOR_AUDIT_PATH_BATCH_SIZE` | `audit.path_batch_size` (`[1, 100000]`, default `2000` — in-memory window for the audit-run path streamer AND Neo4j cursor `page_size`; lower for memory-constrained hosts, raise for very fast Neo4j paired with slow LLM workers) |
+| `XAUDITOR_AUDIT_PERSIST_FALSE_POSITIVES` | `audit.persist_false_positives` (boolean, default `false` — when `false`, validator-confirmed False Positives are dropped from reportdb / Neo4j and `false-positives.md` writes only an explanatory note) |
 | `XAUDITOR_AUDIT_SHUTDOWN_TIMEOUT_SECONDS` | `audit.shutdown_timeout_seconds` (`[1, 600]`) |
 | `XAUDITOR_AUDIT_CODER_SHUTDOWN_TIMEOUT_SECONDS` | `audit.coder.shutdown_timeout_seconds` (must `>= audit.shutdown_timeout_seconds`) |
 | `XAUDITOR_AUDIT_MAX_FINDINGS_PER_UNIT` | `audit.max_findings_per_unit` |

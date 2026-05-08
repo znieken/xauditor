@@ -6,7 +6,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from xauditor.audit.planner import plan_audit_paths
+from xauditor.audit.planner import stream_audit_units
+from xauditor.audit.streamer import PathStreamer
 from xauditor.audit.coder import startup_log_line
 from xauditor.audit.preflight import check_coder_runtime
 from xauditor.audit._cancellation import RunCancellation
@@ -39,7 +40,7 @@ from xauditor.integrations.reportdb import (
     PostgresContainerManager,
 )
 from xauditor.model_factory import ensure_provider_runtime_available, missing_temperature_warning
-from xauditor.models import AuditRun, GraphBuildStatus
+from xauditor.models import AuditRun, GraphBuildStatus, ValidationStatus
 from xauditor.reporting.sinks import (
     ProgressEvent,
     ReportSinkBus,
@@ -119,6 +120,35 @@ def _rate_limited_heartbeat(sink, *, interval_seconds: float):
         sink(event)
 
     return emit
+
+
+def _audit_run_for_persistence(
+    audit_run: AuditRun, *, persist_false_positives: bool
+) -> AuditRun:
+    """Return ``audit_run`` minus its False-Positive findings unless
+    ``persist_false_positives`` is true.
+
+    Implements the ``short-circuit-validator-fp`` persistence
+    boundary: FPs stay in the in-memory snapshot (so coverage and
+    per-stage counts remain accurate) but are dropped from the Neo4j
+    ``persist_audit_run`` payload by default. Operators who want
+    validator-quality triage from reportdb / Neo4j set
+    ``audit.persist_false_positives: true``.
+    """
+
+    if persist_false_positives:
+        return audit_run
+    return AuditRun(
+        build_fingerprint=audit_run.build_fingerprint,
+        findings=tuple(
+            f
+            for f in audit_run.findings
+            if f.validation_status != ValidationStatus.FALSE_POSITIVE
+        ),
+        coverage=audit_run.coverage,
+        checkpoints=audit_run.checkpoints,
+        shared_state=audit_run.shared_state,
+    )
 
 
 def _run_reportdb_migrations_if_available(
@@ -790,9 +820,14 @@ class ApplicationServices:
         )
         if logger is not None:
             logger.info(f"Starting audit for {source.build_fingerprint}")
-        plan = plan_audit_paths(source)
+        streamer = stream_audit_units(
+            source, batch_size=config.audit.path_batch_size
+        )
         if logger is not None:
-            logger.info(f"Planned {len(plan.audit_units)} audit paths")
+            logger.info(
+                f"Planned {streamer.total} audit paths "
+                f"(streaming, batch_size={streamer.batch_size})"
+            )
 
         run_label = datetime.now().strftime("%Y%m%d-%H%M%S")
         sink_bus = ReportSinkBus(self._build_postgres_sink(logger=logger))
@@ -811,7 +846,7 @@ class ApplicationServices:
         return self._drive_workflow(
             config=config,
             source=source,
-            plan=plan,
+            streamer=streamer,
             sink_bus=sink_bus,
             run_label=run_label,
             skip_paths=frozenset(),
@@ -904,7 +939,9 @@ class ApplicationServices:
                 f"Resuming audit {target.run_label} for {target.build_fingerprint} "
                 f"({len(prior_shared_state)} paths already recorded)"
             )
-        plan = plan_audit_paths(source)
+        streamer = stream_audit_units(
+            source, batch_size=config.audit.path_batch_size
+        )
 
         sink_bus = ReportSinkBus(self._build_postgres_sink(logger=logger))
         run_meta = self._build_run_meta(
@@ -926,7 +963,7 @@ class ApplicationServices:
         return self._drive_workflow(
             config=config,
             source=source,
-            plan=plan,
+            streamer=streamer,
             sink_bus=sink_bus,
             run_label=target.run_label,
             skip_paths=frozenset(prior_shared_state.keys()),
@@ -1072,7 +1109,7 @@ class ApplicationServices:
         *,
         config: XAuditorConfig,
         source: Neo4jAuditGraphSource,
-        plan,
+        streamer: PathStreamer,
         sink_bus: ReportSinkBus,
         run_label: str,
         skip_paths: frozenset[str],
@@ -1105,7 +1142,19 @@ class ApplicationServices:
             sink_bus.write_progress, interval_seconds=2.0
         )
 
+        persist_fp = config.audit.persist_false_positives
+
         def _on_finding_upsert(finding):
+            # ``short-circuit-validator-fp``: drop FP findings at the
+            # reportdb sink-bus boundary unless the operator opts in
+            # via ``audit.persist_false_positives``. The in-memory
+            # snapshot is unaffected, so coverage and per-stage counts
+            # remain accurate.
+            if (
+                not persist_fp
+                and finding.validation_status == ValidationStatus.FALSE_POSITIVE
+            ):
+                return
             sink_bus.upsert_finding(run_label, finding)
 
         def _on_progress(snapshot):
@@ -1151,7 +1200,7 @@ class ApplicationServices:
         try:
             audit_run = workflow.run(
                 source=source,
-                plan=plan,
+                streamer=streamer,
                 on_progress=_on_progress,
                 on_heartbeat=heartbeat_cb,
                 on_finding_upsert=_on_finding_upsert,
@@ -1219,7 +1268,15 @@ class ApplicationServices:
             sink_bus.fail_run(status="failed", error=summary)
             raise
 
-        self.neo4j.persist_audit_run(audit_run)
+        # ``short-circuit-validator-fp``: when persistence is opted-out,
+        # filter FPs out of the Neo4j payload only. The in-memory
+        # snapshot (``state_store.save_audit_run`` + ``emit_snapshot``)
+        # keeps every finding so resume state and portal SSE updates
+        # remain complete; downstream stage counts stay accurate.
+        persisted_run = _audit_run_for_persistence(
+            audit_run, persist_false_positives=persist_fp
+        )
+        self.neo4j.persist_audit_run(persisted_run)
         self.state_store.save_audit_run(audit_run)
         sink_bus.emit_snapshot(audit_run)
         # On clean completion the run is no longer resumable; clear the
@@ -1271,6 +1328,7 @@ class ApplicationServices:
             output_dir=output_dir,
             include_debug=include_debug,
             logger=logger,
+            persist_false_positives=self.config.audit.persist_false_positives,
         )
 
     @staticmethod

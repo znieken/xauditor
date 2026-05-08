@@ -72,6 +72,19 @@ class _StubValidator:
         return ValidationResult(status=ValidationStatus.VALID, analysis="Validated")
 
 
+class _StubFalsePositiveValidator:
+    """Validator stub that always votes False Positive — exercises the
+    ``short-circuit-validator-fp`` coder-dispatch suppression path.
+    """
+
+    def run(self, *, unit, analyzer, exploitation=None, path_context=None):
+        del unit, analyzer, exploitation, path_context
+        return ValidationResult(
+            status=ValidationStatus.FALSE_POSITIVE,
+            analysis="Sanitizer fully neutralizes the sink — not exploitable.",
+        )
+
+
 class _FakeDispatcher:
     """In-process stand-in for ``CoderDispatcher``.
 
@@ -182,6 +195,7 @@ def _build(
     *,
     coder_enabled: bool,
     dispatcher: _FakeDispatcher | None = None,
+    validator_agent=None,
 ):
     (repo_root / "app.py").write_text(SAMPLE_APP, encoding="utf-8")
     env = {
@@ -207,7 +221,7 @@ def _build(
         llm_client=LLMClient.from_config(config.llm),
         analyzer_agent=_StubAnalyzer(),
         exploitation_agent=_StubExploitation(),
-        validator_agent=_StubValidator(),
+        validator_agent=validator_agent or _StubValidator(),
         coder_dispatcher=dispatcher,  # type: ignore[arg-type]
     )
     return workflow, plan, source
@@ -405,6 +419,41 @@ class CoderCancellationTests(unittest.TestCase):
             self.assertEqual(upsert_calls[0].finding_id, "F-1")
             self.assertEqual(upsert_calls[0].coder_status, CODER_STATUS_SKIPPED)
             self.assertEqual(on_progress_calls, [])
+
+
+class CoderSkipsOnValidatorFalsePositiveTests(unittest.TestCase):
+    """``short-circuit-validator-fp`` — when the validator votes False
+    Positive, the coder dispatch SHALL be suppressed regardless of
+    ``coder.enabled``. The finding still appears in the in-memory
+    snapshot (so coverage and per-stage counts stay accurate), but its
+    ``coder_status`` carries the default ``Skipped``.
+    """
+
+    def test_fp_finding_does_not_dispatch_coder(self) -> None:
+        dispatcher = _FakeDispatcher()
+        with tempfile.TemporaryDirectory() as tmp:
+            workflow, plan, source = _build(
+                Path(tmp),
+                coder_enabled=True,
+                dispatcher=dispatcher,
+                validator_agent=_StubFalsePositiveValidator(),
+            )
+            self.assertGreater(len(plan.audit_units), 0)
+            run = workflow.run(plan=plan, source=source)
+        # Coder dispatcher SHALL NOT have been called for the FP finding.
+        self.assertEqual(
+            dispatcher.submitted,
+            [],
+            msg="Validator FP must suppress coder dispatch even when coder.enabled=true.",
+        )
+        # The FP finding still lands in the in-memory snapshot so
+        # coverage and per-stage counts remain accurate.
+        self.assertGreaterEqual(len(run.findings), 1)
+        for finding in run.findings:
+            self.assertEqual(
+                finding.validation_status, ValidationStatus.FALSE_POSITIVE
+            )
+            self.assertEqual(finding.coder_status, CODER_STATUS_SKIPPED)
 
 
 if __name__ == "__main__":

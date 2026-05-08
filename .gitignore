@@ -33,4 +33,3 @@ deploy/packages/*
 deploy/install/*.log
 mypy.log
 lint.log
-.claude

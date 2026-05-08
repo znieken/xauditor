@@ -15,6 +15,7 @@ import { OverrideBadge } from "@/components/override-badge";
 import { AgentOverridesSection } from "@/components/agent-overrides-section";
 import type { AgentDraft } from "@/components/agent-overrides-section";
 import { AuditSection } from "@/components/audit-section";
+import type { AuditDraft } from "@/components/audit-section";
 import {
   CoderSection,
   isLocalEndpoint,
@@ -222,9 +223,7 @@ export default function SettingsPage() {
   const [graphBuildDraft, setGraphBuildDraft] = React.useState<GraphBuildDraft>(
     {},
   );
-  const [auditDraft, setAuditDraft] = React.useState<string | undefined>(
-    undefined,
-  );
+  const [auditDraft, setAuditDraft] = React.useState<AuditDraft>({});
   const [auditModeDraft, setAuditModeDraft] = React.useState<AuditModeDraft>({});
   const [coderDraft, setCoderDraft] = React.useState<CoderDraft>({});
   const [note, setNote] = React.useState("");
@@ -393,11 +392,26 @@ export default function SettingsPage() {
     }
 
     // Audit.
-    if (auditDraft !== undefined && !isReadOnly("audit.worker_count")) {
-      const parsed = Number(auditDraft);
+    if (
+      auditDraft.worker_count !== undefined
+      && auditDraft.worker_count !== ""
+      && !isReadOnly("audit.worker_count")
+    ) {
+      const parsed = Number(auditDraft.worker_count);
       if (Number.isFinite(parsed)) {
         setNested(body, "audit.worker_count", parsed);
       }
+    }
+    if (
+      auditDraft.persist_false_positives !== undefined
+      && auditDraft.persist_false_positives !== ""
+      && !isReadOnly("audit.persist_false_positives")
+    ) {
+      setNested(
+        body,
+        "audit.persist_false_positives",
+        coerce(auditDraft.persist_false_positives, "boolean"),
+      );
     }
 
     // Audit mode (canonical new shape — `audit.mode` preset +
@@ -647,7 +661,7 @@ export default function SettingsPage() {
       setDefaultProviderDraft(undefined);
       setRepositoryDraft(undefined);
       setGraphBuildDraft({});
-      setAuditDraft(undefined);
+      setAuditDraft({});
       setAuditModeDraft({});
       setCoderDraft({});
       setNote("");
@@ -888,8 +902,8 @@ export default function SettingsPage() {
       >
         <AuditSection
           fields={fields}
-          value={auditDraft ?? String(fields["audit.worker_count"]?.value ?? "")}
-          onChange={(next) => setAuditDraft(next)}
+          draft={auditDraft}
+          onChange={(patch) => setAuditDraft((prev) => ({ ...prev, ...patch }))}
         />
       </SectionShell>
 

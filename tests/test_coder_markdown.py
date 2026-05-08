@@ -184,6 +184,60 @@ class FindingsReportInlineCoderTests(unittest.TestCase):
         self.assertIn("### Coder Verification", text)
         self.assertIn("**Coder Status**: Not Verified", text)
 
+    def test_false_positives_report_writes_explanatory_note_when_persist_disabled(
+        self,
+    ) -> None:
+        """``short-circuit-validator-fp`` — when
+        ``audit.persist_false_positives`` is False (the default), the
+        artifact SHALL still be emitted but its body SHALL contain only
+        the header and an explanatory note. FP findings SHALL NOT
+        render even when present in the input.
+        """
+
+        findings = [
+            _make_finding(
+                finding_id="F-0009",
+                validation_status=ValidationStatus.FALSE_POSITIVE,
+                coder_status=CODER_STATUS_NOT_VERIFIED,
+                coder_analysis="confirmed false positive",
+                coder_reason="never reached",
+            )
+        ]
+        text = render_false_positives_report(
+            findings, coder_enabled=True, persist_false_positives=False
+        )
+        self.assertIn("# False Positives Report", text)
+        self.assertIn(
+            "FP persistence disabled", text,
+            msg="The explanatory note SHALL appear when knob is False.",
+        )
+        self.assertIn("audit.persist_false_positives", text)
+        # Per-finding body SHALL NOT render under the disabled knob.
+        self.assertNotIn("F-0009", text)
+        self.assertNotIn("### Coder Verification", text)
+        self.assertNotIn("Not Verified", text)
+
+    def test_false_positives_report_renders_body_when_persist_enabled(
+        self,
+    ) -> None:
+        findings = [
+            _make_finding(
+                finding_id="F-0009",
+                validation_status=ValidationStatus.FALSE_POSITIVE,
+                coder_status=CODER_STATUS_NOT_VERIFIED,
+                coder_analysis="confirmed false positive",
+                coder_reason="never reached",
+            )
+        ]
+        text = render_false_positives_report(
+            findings, coder_enabled=True, persist_false_positives=True
+        )
+        # Same as today's behavior — full body renders when knob is True.
+        self.assertIn("# False Positives Report", text)
+        self.assertIn("F-0009", text)
+        self.assertIn("**Coder Status**: Not Verified", text)
+        self.assertNotIn("FP persistence disabled", text)
+
 
 # --------------------------------------------------------------------------
 # Fail status rendering (multi-project-coder-service §10.1, §10.2)

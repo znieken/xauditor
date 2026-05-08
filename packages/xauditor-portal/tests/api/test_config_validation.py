@@ -9,7 +9,10 @@ from xauditor_portal.api.config import (
     _validate_sampling_field,
     _validate_sampling_payload,
 )
-from xauditor_portal.config_resolver import forbidden_keys_in_payload
+from xauditor_portal.config_resolver import (
+    forbidden_keys_in_payload,
+    is_ui_editable,
+)
 
 
 class ValidateSamplingFieldTests(unittest.TestCase):
@@ -196,6 +199,24 @@ class ValidateNumericPayloadTests(unittest.TestCase):
         self.assertEqual(len(_validate_numeric_payload({"coder": {"concurrency": 0}})), 1)
         self.assertEqual(len(_validate_numeric_payload({"coder": {"concurrency": 65}})), 1)
 
+    def test_graph_build_paths_max_count_accepts_zero(self) -> None:
+        # ``audit-stream-path-loading``: the historical >= 1 lower
+        # bound widened to >= 0; ``0`` means "no cap; enumerate every
+        # reachable path" and is the new default.
+        self.assertEqual(
+            _validate_numeric_payload({"graph": {"build": {"paths_max_count": 0}}}),
+            [],
+        )
+        self.assertEqual(
+            _validate_numeric_payload({"graph": {"build": {"paths_max_count": 100_000}}}),
+            [],
+        )
+        errors = _validate_numeric_payload(
+            {"graph": {"build": {"paths_max_count": -1}}}
+        )
+        self.assertEqual(len(errors), 1)
+        self.assertIn("graph.build.paths_max_count", errors[0])
+
     def test_graph_build_neo4j_chunk_size_bounds(self) -> None:
         self.assertEqual(
             _validate_numeric_payload(
@@ -264,6 +285,29 @@ class CollectEnvOverridesTests(unittest.TestCase):
         env = {"XAUDITOR_AUDIT_WORKER_COUNT": "4"}
         overrides = _collect_env_overrides(env)
         self.assertEqual(overrides.get("audit.worker_count"), "4")
+
+    def test_picks_up_audit_persist_false_positives(self) -> None:
+        env = {"XAUDITOR_AUDIT_PERSIST_FALSE_POSITIVES": "true"}
+        overrides = _collect_env_overrides(env)
+        self.assertEqual(
+            overrides.get("audit.persist_false_positives"), "true"
+        )
+
+
+class AuditPersistFalsePositivesEditableTests(unittest.TestCase):
+    """``short-circuit-validator-fp`` — the new boolean knob is
+    UI-editable through the ``audit.*`` allow-list prefix and is NOT
+    forbidden as a secret-shaped key.
+    """
+
+    def test_audit_persist_false_positives_is_ui_editable(self) -> None:
+        self.assertTrue(is_ui_editable("audit.persist_false_positives"))
+
+    def test_audit_persist_false_positives_payload_is_not_forbidden(self) -> None:
+        forbidden = forbidden_keys_in_payload(
+            {"audit": {"persist_false_positives": True}}
+        )
+        self.assertNotIn("audit.persist_false_positives", forbidden)
 
 
 if __name__ == "__main__":

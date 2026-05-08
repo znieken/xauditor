@@ -216,7 +216,11 @@ class GraphBuildConfig:
     enable_llm_enrichment: bool = True
     max_file_bytes: int = 10_000_000
     paths_max_depth: int = 40
-    paths_max_count: int = 50_000
+    # 0 == "no cap; enumerate every reachable path" (default since
+    # ``audit-stream-path-loading``: audit-time runtime memory is now
+    # governed by ``audit.path_batch_size``, so build-time count
+    # capping is opt-in for operators who want it).
+    paths_max_count: int = 0
     # Chunk size for ``canonical_finalize`` streaming writes into Neo4j.
     # Each per-record-kind UNWIND-MERGE batch sends this many records
     # per Bolt round trip. The default of 5,000 is a sweet spot for
@@ -269,12 +273,30 @@ class AuditConfig:
     expires. Bounded ``[1, 600]``. A startup warning fires when it is
     ``>= shutdown_timeout_seconds`` because in that configuration the
     coder layer cannot finish gracefully under the run-level cap.
+
+    ``path_batch_size`` is the in-memory window size for the audit
+    workflow's path streamer (see ``audit-stream-path-loading``). It
+    sets BOTH the bounded queue capacity between the streamer's
+    fetcher thread and the workflow's sliding-window submitter AND
+    the Neo4j cursor ``page_size`` used by ``iter_path_records``.
+    Bounded ``[1, 100_000]``; default ``2000``.
     """
 
     worker_count: int = 1
     shutdown_timeout_seconds: int = 30
     coder_shutdown_timeout_seconds: int = 20
+    path_batch_size: int = 2000
     sinks: "AuditSinksConfig" = field(default_factory=lambda: AuditSinksConfig())
+    # Whether validator-confirmed False Positive findings get persisted
+    # to the report stores (reportdb sink + Neo4j persist_audit_run) and
+    # rendered into ``false-positives.md``. Default is ``False`` —
+    # the validator-FP-skip-coder short-circuit (see
+    # ``short-circuit-validator-fp`` change) means FP findings already
+    # bypass the coder stage; this knob extends that bypass to the
+    # persistence and export boundary so the report stores stop
+    # accumulating noise. Operators who want to triage validator
+    # quality from reportdb can set this to ``True``.
+    persist_false_positives: bool = False
 
 
 @dataclass(frozen=True)
@@ -846,6 +868,8 @@ ENV_KEY_MAP = {
     "XAUDITOR_AUDIT_WORKER_COUNT": "audit.worker_count",
     "XAUDITOR_AUDIT_SHUTDOWN_TIMEOUT_SECONDS": "audit.shutdown_timeout_seconds",
     "XAUDITOR_AUDIT_CODER_SHUTDOWN_TIMEOUT_SECONDS": "audit.coder.shutdown_timeout_seconds",
+    "XAUDITOR_AUDIT_PATH_BATCH_SIZE": "audit.path_batch_size",
+    "XAUDITOR_AUDIT_PERSIST_FALSE_POSITIVES": "audit.persist_false_positives",
     "XAUDITOR_AUDIT_SINKS_WELL_KNOWN": "audit.sinks.well_known",
     "XAUDITOR_AUDIT_SINKS_CUSTOM": "audit.sinks.custom",
     "XAUDITOR_REPOSITORY_EXCLUDES": "repository.excludes",
@@ -1051,6 +1075,12 @@ def _build_audit_config(data: Mapping[str, Any]) -> AuditConfig:
         minimum=1,
         maximum=600,
     )
+    path_batch_size = _normalize_bounded_int(
+        audit_raw.get("path_batch_size", defaults.path_batch_size),
+        field_name="audit.path_batch_size",
+        minimum=1,
+        maximum=100_000,
+    )
     audit_coder_raw = audit_raw.get("coder") or {}
     if not isinstance(audit_coder_raw, Mapping):
         raise ConfigError("Invalid audit.coder configuration; expected a mapping.")
@@ -1088,11 +1118,19 @@ def _build_audit_config(data: Mapping[str, Any]) -> AuditConfig:
             field_name="audit.sinks.custom",
         ),
     )
+    persist_false_positives = _normalize_bool(
+        audit_raw.get(
+            "persist_false_positives", defaults.persist_false_positives
+        ),
+        field_name="audit.persist_false_positives",
+    )
     return AuditConfig(
         worker_count=worker_count,
         shutdown_timeout_seconds=shutdown_timeout,
         coder_shutdown_timeout_seconds=coder_shutdown_timeout,
+        path_batch_size=path_batch_size,
         sinks=sinks,
+        persist_false_positives=persist_false_positives,
     )
 
 
@@ -1610,7 +1648,7 @@ def _build_graph_config(data: Mapping[str, Any]) -> GraphConfig:
     paths_max_count = _normalize_positive_int(
         build_data.get("paths_max_count", defaults.paths_max_count),
         field_name="graph.build.paths_max_count",
-        minimum=1,
+        minimum=0,
     )
     neo4j_chunk_size = _resolve_neo4j_chunk_size(
         build_data.get("neo4j_chunk_size"),

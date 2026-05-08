@@ -47,7 +47,7 @@ graph:
     enable_llm_enrichment: false              # default true
     # max_file_bytes: 10000000               # skip files larger than this
     # paths_max_depth: 40                    # path-enumeration recursion cap
-    # paths_max_count: 50000                 # path-enumeration count cap
+    # paths_max_count: 0                     # 0 = no cap (default); positive int to opt in
     # neo4j_chunk_size: 5000                 # default 5000, clamped [100, 50000]
 
 # ---------------------------------------------------------------------------
@@ -180,6 +180,17 @@ audit:
   # crash isolation. Range [1, 16].
   worker_count: 1
   shutdown_timeout_seconds: 30                 # default 30, range [1, 600]
+  # Path streamer in-memory window AND Neo4j cursor page_size for the
+  # audit-run hot path. Workers never block on Neo4j between paths
+  # because the streamer's bounded queue keeps fetcher and consumers
+  # overlapped. Range [1, 100000]; default 2000.
+  # path_batch_size: 2000
+  # When `false` (default), validator-confirmed False Positives are
+  # dropped at the report-store boundary: reportdb / Neo4j receive no
+  # FP rows and `false-positives.md` is emitted with only an
+  # explanatory note. Set `true` to restore the historical behavior of
+  # persisting every finding regardless of validator verdict.
+  # persist_false_positives: false
   coder:
     shutdown_timeout_seconds: 20               # default 20, must be < audit.shutdown_timeout_seconds
 

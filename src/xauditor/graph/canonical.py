@@ -675,6 +675,11 @@ class CanonicalGraphTransformer:
 
         count_cap_hit = False
         depth_cap_hit = False
+        # ``max_count <= 0`` means "no cap; enumerate every reachable
+        # path" (default since ``audit-stream-path-loading``). The
+        # truncation marker for ``max_count_reached`` is suppressed in
+        # that case; depth-cap truncation still fires below.
+        count_cap_active = max_count > 0
         for entry_id in entry_ids:
             if count_cap_hit:
                 break
@@ -682,7 +687,7 @@ class CanonicalGraphTransformer:
             visited: set[str] = {entry_id}
             iter_stack: list = [iter(outgoing_sorted.get(entry_id, ()))]
             while stack:
-                if emitted >= max_count:
+                if count_cap_active and emitted >= max_count:
                     if not truncation_emitted:
                         yield _TruncationMarker(reason="max_count_reached", cap=max_count)
                         truncation_emitted = True

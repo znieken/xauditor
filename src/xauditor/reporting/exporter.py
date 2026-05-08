@@ -85,6 +85,7 @@ def export_audit_run(
     output_dir: Path | None = None,
     include_debug: bool = False,
     logger: "RuntimeLogger | None" = None,
+    persist_false_positives: bool = True,
 ) -> str | list[Path]:
     """Render the persisted audit run identified by ``run_label``.
 
@@ -119,6 +120,7 @@ def export_audit_run(
         audit_run=audit_run,
         output_dir=output_dir,
         redact=redact,
+        persist_false_positives=persist_false_positives,
     )
 
 
@@ -604,6 +606,7 @@ def _render_markdown_bundle(
     audit_run: AuditRun,
     output_dir: Path,
     redact,
+    persist_false_positives: bool = True,
 ) -> list[Path]:
     """Render the four findings/coverage-derived files into ``output_dir``.
 
@@ -634,7 +637,9 @@ def _render_markdown_bundle(
         _write_md(
             output_dir / "false-positives.md",
             render_false_positives_report(
-                audit_run.findings, coder_enabled=coder_enabled
+                audit_run.findings,
+                coder_enabled=coder_enabled,
+                persist_false_positives=persist_false_positives,
             ),
             redact=redact,
         )

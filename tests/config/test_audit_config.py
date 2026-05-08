@@ -238,5 +238,97 @@ class AuditConfigPathConcurrencyRemovedTests(unittest.TestCase):
             )
 
 
+class AuditPersistFalsePositivesTests(unittest.TestCase):
+    """Coverage for ``audit.persist_false_positives`` — yaml + env + invalid input.
+
+    Default is ``False`` — the validator-FP-skip-coder short-circuit
+    bypasses the persistence and export boundary so reportdb / Neo4j
+    stop accumulating noise. Operators opt in by setting the knob to
+    ``True``.
+    """
+
+    def test_dataclass_default_is_false(self) -> None:
+        cfg = AuditConfig()
+        self.assertFalse(cfg.persist_false_positives)
+
+    def test_omitted_block_uses_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _write_yaml(repo_root, _BASE_LLM)
+            config = load_config(repo_root=repo_root, env={"HOME": tmp})
+            self.assertFalse(config.audit.persist_false_positives)
+
+    def test_yaml_true_parses(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _write_yaml(
+                repo_root,
+                _BASE_LLM
+                + textwrap.dedent(
+                    """
+                    audit:
+                      persist_false_positives: true
+                    """
+                ),
+            )
+            config = load_config(repo_root=repo_root, env={"HOME": tmp})
+            self.assertTrue(config.audit.persist_false_positives)
+
+    def test_yaml_false_parses(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _write_yaml(
+                repo_root,
+                _BASE_LLM
+                + textwrap.dedent(
+                    """
+                    audit:
+                      persist_false_positives: false
+                    """
+                ),
+            )
+            config = load_config(repo_root=repo_root, env={"HOME": tmp})
+            self.assertFalse(config.audit.persist_false_positives)
+
+    def test_env_overrides_yaml(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _write_yaml(
+                repo_root,
+                _BASE_LLM
+                + textwrap.dedent(
+                    """
+                    audit:
+                      persist_false_positives: false
+                    """
+                ),
+            )
+            config = load_config(
+                repo_root=repo_root,
+                env={
+                    "HOME": tmp,
+                    "XAUDITOR_AUDIT_PERSIST_FALSE_POSITIVES": "true",
+                },
+            )
+            self.assertTrue(config.audit.persist_false_positives)
+
+    def test_invalid_value_raises_config_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            _write_yaml(
+                repo_root,
+                _BASE_LLM
+                + textwrap.dedent(
+                    """
+                    audit:
+                      persist_false_positives: maybe
+                    """
+                ),
+            )
+            with self.assertRaises(ConfigError) as ctx:
+                load_config(repo_root=repo_root, env={"HOME": tmp})
+            self.assertIn("audit.persist_false_positives", str(ctx.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

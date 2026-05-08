@@ -794,7 +794,10 @@ class LangChainGraphBuilder:
             self.logger.info(
                 "Path enumeration truncated: "
                 f"reason={reason} cap={cap}. "
-                "Raise graph.build.paths_max_depth / graph.build.paths_max_count in configuration to enumerate more paths."
+                "Set graph.build.paths_max_count to 0 (the new default) "
+                "for unbounded enumeration; the audit-run path budget is "
+                "now governed by audit.path_batch_size, not paths_max_count. "
+                "Raise graph.build.paths_max_depth if depth-capped."
             )
         if state_store is not None:
             state_store.mark_canonical_complete(

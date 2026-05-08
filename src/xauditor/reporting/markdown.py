@@ -188,7 +188,25 @@ def render_false_positives_report(
     findings: tuple[Finding, ...] | list[Finding],
     *,
     coder_enabled: bool = False,
+    persist_false_positives: bool = True,
 ) -> str:
+    """Render ``false-positives.md``.
+
+    When ``persist_false_positives`` is False (the
+    ``short-circuit-validator-fp`` default), the artifact SHALL still
+    be emitted to preserve the "always emit both files" contract, but
+    its body SHALL contain only the report header and an explanatory
+    note pointing operators at the knob. FP findings are NOT rendered.
+    When True, today's behavior is preserved (every FP finding rendered
+    using the same per-finding structure as ``findings.md``).
+    """
+
+    if not persist_false_positives:
+        return (
+            "# False Positives Report\n\n"
+            "_FP persistence disabled — set `audit.persist_false_positives: "
+            "true` to populate this report._\n"
+        )
     filtered = [f for f in findings if f.validation_status == ValidationStatus.FALSE_POSITIVE]
     return _render_findings(filtered, "False Positives Report", coder_enabled=coder_enabled)
 

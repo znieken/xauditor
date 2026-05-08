@@ -44,7 +44,7 @@ graph:
     enable_llm_enrichment: false
     # max_file_bytes: 10000000
     # paths_max_depth: 40
-    # paths_max_count: 50000
+    # paths_max_count: 0     # 0 = no cap (default); set positive int to opt in to count capping
     # neo4j_chunk_size: 5000               # default 5000, clamped [100, 50000]
 
 # ---------------------------------------------------------------------------
@@ -143,6 +143,16 @@ audit:
   mode: deep
   worker_count: 4                              # range [1, 16]
   shutdown_timeout_seconds: 30                 # range [1, 600]
+  # Path streamer in-memory window AND Neo4j cursor page_size. Lower for
+  # memory-constrained hosts, raise for very large repos with fast Neo4j.
+  # Range [1, 100000]; default 2000.
+  # path_batch_size: 2000
+  # `false` (default) drops validator-confirmed False Positives at the
+  # report-store boundary: reportdb / Neo4j get no FP rows and
+  # `false-positives.md` writes only an explanatory note. Set `true`
+  # to keep the historical "persist every finding" behavior — useful
+  # when you want to triage validator quality from reportdb.
+  # persist_false_positives: false
   coder:
     shutdown_timeout_seconds: 20               # must be < audit.shutdown_timeout_seconds
 

@@ -78,6 +78,7 @@ config-parse time naming the offending dot-path.
 | `XAUDITOR_AUDIT_VALIDATOR_DEBATE_MAX_ROUNDS` | `audit.validator.debate.max_rounds` |
 | `XAUDITOR_AUDIT_VALIDATOR_DEBATE_HALT_ON_CONSENSUS` | `audit.validator.debate.halt_on_consensus` |
 | `XAUDITOR_AUDIT_MAX_FINDINGS_PER_UNIT` | `audit.max_findings_per_unit` |
+| `XAUDITOR_AUDIT_PERSIST_FALSE_POSITIVES` | `audit.persist_false_positives` (boolean, default `false`) |
 
 ## Stage order
 
@@ -90,9 +91,25 @@ run when the validator is invoked). The exploiter MAY emit
 `[exploiter downgrade] ...` marker to the validation analysis;
 the validator is NOT re-invoked on the downgrade.
 
-`False Positive` validator verdicts skip the exploiter entirely
-(the finding is recorded with a placeholder
-`exploitation.status="skipped"`).
+`False Positive` validator verdicts short-circuit the rest of the
+per-finding pipeline. The exploiter is skipped (the finding is
+recorded with a placeholder `exploitation.status="skipped"`) AND the
+coder verification stage is skipped regardless of `coder.enabled`
+(the finding is emitted with `coder_status: "Skipped"`, matching the
+`coder.enabled = false` shape). The skip is a structural pipeline
+property — there is no opt-out knob.
+
+The `audit.persist_false_positives` knob (boolean, default `false`)
+extends the bypass to the persistence and export boundary. When
+`false`, FP findings stay in the in-memory snapshot (so coverage
+and per-stage counts remain accurate) but SHALL NOT be upserted
+into the reportdb sink bus, included in the Neo4j
+`persist_audit_run` payload, or rendered into `false-positives.md`
+(the artifact is emitted with only its header and an explanatory
+note pointing at the knob). Operators who want validator-quality
+triage from reportdb / Neo4j set
+`audit.persist_false_positives: true` in `xauditor.yml` (or
+`XAUDITOR_AUDIT_PERSIST_FALSE_POSITIVES=true` in the environment).
 
 ## Multi-finding per audit unit
 

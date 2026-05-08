@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from xauditor.audit.source import AuditGraphSource
+from xauditor.audit.streamer import PathStreamer
 from xauditor.audit.units import AuditUnit as ProtocolAuditUnit
 from xauditor.audit.units import (
     BoundaryAuditUnit,
@@ -263,6 +264,29 @@ def _enumerate_sink_units(
             )
         )
     return units
+
+
+def stream_audit_units(
+    source: AuditGraphSource,
+    *,
+    batch_size: int,
+    llm_client: LLMClient | None = None,
+) -> PathStreamer:
+    """Open a ``PathStreamer`` over ``source`` and return it.
+
+    The hot-path entry for ``services.run_audit`` /
+    ``services.resume_audit``: replaces the eager
+    ``plan_audit_paths`` materialisation, bounding master memory at
+    ``batch_size`` `AuditUnit`s. Caller owns ``close()``.
+
+    The eager ``plan_audit_paths`` factory is kept for non-hot-path
+    consumers (``plan_protocol_audit_units`` and the sink/boundary
+    enumerators it drives).
+    """
+
+    streamer = PathStreamer(source, batch_size=batch_size, llm_client=llm_client)
+    streamer.open()
+    return streamer
 
 
 def plan_audit_paths(

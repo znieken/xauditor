@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+from collections import deque
 from concurrent.futures import Future
 from dataclasses import replace
 from typing import Callable
@@ -28,6 +29,7 @@ from xauditor.audit.reconciler import (
     build_reconciler,
 )
 from xauditor.audit.source import AuditGraphSource
+from xauditor.audit.streamer import EagerPathStreamer, PathStreamer
 from xauditor.audit.stage_runner import (
     PromptStageRunner,
     StageRunner,
@@ -435,7 +437,8 @@ class AuditWorkflow:
         self,
         *,
         source: AuditGraphSource,
-        plan: AuditPlan,
+        plan: AuditPlan | None = None,
+        streamer: "PathStreamer | EagerPathStreamer | None" = None,
         on_progress: Callable[[AuditRun], None] | None = None,
         on_heartbeat: HeartbeatCallback | None = None,
         on_finding_upsert: Callable[[Finding], None] | None = None,
@@ -443,6 +446,15 @@ class AuditWorkflow:
         skip_paths: frozenset[str] = frozenset(),
         prior_shared_state: dict[str, dict[str, object]] | None = None,
     ) -> AuditRun:
+        # Normalise input. ``streamer`` is the production hot path
+        # (``audit-stream-path-loading``); ``plan=`` is retained for
+        # tests and any caller that has a fully-materialised
+        # ``AuditPlan`` and wants the workflow to consume it eagerly.
+        if streamer is None and plan is None:
+            raise TypeError("AuditWorkflow.run requires either streamer= or plan=")
+        if streamer is None:
+            assert plan is not None
+            streamer = EagerPathStreamer(plan.audit_units)
         findings: list[Finding] = []
         checkpoints: dict[str, str] = {}
         shared_state: dict[str, dict[str, object]] = {}
@@ -450,8 +462,8 @@ class AuditWorkflow:
         context_skipped_paths: set[str] = set()
         failed_paths: set[str] = set()
         pending_coder: set[str] = set()
-        total_units = len(plan.audit_units)
-        all_fingerprints = [item.path.path_fingerprint for item in plan.audit_units]
+        total_units = streamer.total
+        all_fingerprints: list[str] = []
         prior_state = dict(prior_shared_state or {})
 
         def _emit(kind: str, stage: str, *, index: int | None = None, message: str = "") -> None:
@@ -533,13 +545,27 @@ class AuditWorkflow:
                 source=source,
             )
 
-        try:
-            # First pass: submit every non-resume path to the pool;
-            # handle resume-skip paths inline. ``submitted`` keeps
-            # the plan-order list of (index, unit, future|None).
-            submitted: list[tuple[int, AuditUnit, "Future[PathResult] | None"]] = []
-            for index, candidate_unit in enumerate(plan.audit_units, start=1):
-                path_fp = candidate_unit.path.path_fingerprint
+        # Sliding-window submission/reap (``audit-stream-path-loading``).
+        # ``in_flight`` holds at most ``streamer.batch_size`` entries; the
+        # streamer's bounded queue and ``next_or_none`` block-and-resume
+        # semantics mean Neo4j fetch latency is overlapped with LLM work.
+        # ``plan_index`` is monotonic in fingerprint order (the streamer
+        # yields by ``ORDER BY p.path_fingerprint``), preserving the
+        # plan-order finding-id contract from the eager workflow.
+        in_flight: deque[tuple[int, AuditUnit, "Future[PathResult] | None"]] = deque()
+        plan_index = 0
+        window = max(1, streamer.batch_size)
+
+        def _topup() -> None:
+            nonlocal plan_index
+            while len(in_flight) < window:
+                unit = streamer.next_or_none()
+                if unit is None:
+                    return
+                plan_index += 1
+                local_index = plan_index
+                path_fp = unit.path.path_fingerprint
+                all_fingerprints.append(path_fp)
                 if path_fp in skip_paths:
                     prior_entry = prior_state.get(path_fp)
                     if prior_entry:
@@ -551,35 +577,34 @@ class AuditWorkflow:
                             or prior_entry.get("checkpoint_status")
                             or "resumed"
                         )
-                        completed_units.append(candidate_unit)
+                        completed_units.append(unit)
                         if self.logger is not None:
                             self.logger.info(
-                                f"Resume: skipped completed path {index}/{total_units}"
+                                f"Resume: skipped completed path {local_index}/{total_units}"
                             )
                         _emit(
                             "progress",
                             "analyzer",
-                            index=index,
-                            message=f"Resume: skipped completed path {index}/{total_units}",
+                            index=local_index,
+                            message=f"Resume: skipped completed path {local_index}/{total_units}",
                         )
                         if on_progress is not None:
                             on_progress(_current_snapshot())
-                        submitted.append((index, candidate_unit, None))
+                        in_flight.append((local_index, unit, None))
                         continue
                     if self.logger is not None:
                         self.logger.warning(
                             f"Resume: path {path_fp} marked skip but no prior state; "
                             "re-executing from scratch."
                         )
-                future = pool.submit_path(_runner, index, candidate_unit)
-                submitted.append((index, candidate_unit, future))
+                future = pool.submit_path(_runner, local_index, unit)
+                in_flight.append((local_index, unit, future))
 
-            # Second pass: walk in plan order, blocking on each
-            # future and aggregating its outcome into shared state.
-            # Plan-order traversal keeps finding-ids deterministic
-            # regardless of which thread (or, in Phase 3, which
-            # worker) actually produced each PathResult.
-            for index, candidate_unit, future in submitted:
+        try:
+            while True:
+                _topup()
+                if not in_flight:
+                    break
                 # Drain coder verdicts that landed since the previous
                 # path's aggregation, if any.
                 if self.coder_enabled:
@@ -590,8 +615,9 @@ class AuditWorkflow:
                         snapshot_factory=_current_snapshot,
                         on_finding_upsert=on_finding_upsert,
                     )
+                index, candidate_unit, future = in_flight.popleft()
                 if future is None:
-                    # Resume-skip path; already handled above.
+                    # Resume-skip path; already handled at top-up.
                     continue
                 result = future.result()
                 fp = result.path_fingerprint
@@ -626,7 +652,21 @@ class AuditWorkflow:
                             agentic_transcript=agentic_transcript_for_unit,
                         )
                         if finding is not None:
-                            if self.coder_enabled and self.coder_dispatcher is not None:
+                            # Validator-FP short-circuit
+                            # (``short-circuit-validator-fp``):
+                            # findings the validator marked False
+                            # Positive bypass the coder dispatch
+                            # entirely. The finding's default
+                            # ``coder_status`` (``"Skipped"``) carries
+                            # through to the snapshot, matching the
+                            # ``coder.enabled = false`` shape.
+                            should_dispatch_coder = (
+                                self.coder_enabled
+                                and self.coder_dispatcher is not None
+                                and finding.validation_status
+                                != ValidationStatus.FALSE_POSITIVE
+                            )
+                            if should_dispatch_coder:
                                 finding = self._dispatch_coder(
                                     finding=finding,
                                     unit=unit,
@@ -764,6 +804,11 @@ class AuditWorkflow:
                 logger=self.logger,
                 stage_name="worker_pool",
             )
+            # Stop the path streamer's fetcher thread (if any) so it
+            # doesn't outlive the run. ``EagerPathStreamer.close`` is a
+            # no-op past completion; ``PathStreamer.close`` joins the
+            # background thread within ``audit.shutdown_timeout_seconds``.
+            streamer.close(wait=True)
 
         # Per-path loop is finished; drain any coder tasks still in flight
         # before declaring the run complete.

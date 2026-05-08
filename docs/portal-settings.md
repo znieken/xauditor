@@ -48,9 +48,11 @@ also names the key.
 | Graph build | `graph.build.enable_llm_enrichment` | boolean | — |
 | Graph build | `graph.build.max_file_bytes` | int | `≥ 1` |
 | Graph build | `graph.build.paths_max_depth` | int | `≥ 1` |
-| Graph build | `graph.build.paths_max_count` | int | `≥ 1` |
+| Graph build | `graph.build.paths_max_count` | int | `≥ 0` (default `0` = no cap; positive int caps path enumeration) |
 | Graph build | `graph.build.neo4j_chunk_size` | int | `[100, 50000]` |
 | Audit | `audit.worker_count` | int | `[1, 16]` |
+| Audit | `audit.path_batch_size` | int | `[1, 100000]` (default `2000`; in-memory path-streamer window AND Neo4j cursor page_size) |
+| Audit | `audit.persist_false_positives` | boolean | default `false` (drop FP findings from reportdb / Neo4j and `false-positives.md` body) |
 | Audit mode | `audit.mode` | enum | `fast \| deep` |
 | Audit mode | `audit.max_findings_per_unit` | int | `[1, 20]` |
 | Audit mode | `audit.replication.<stage>` | int | `[1, 20]` |
