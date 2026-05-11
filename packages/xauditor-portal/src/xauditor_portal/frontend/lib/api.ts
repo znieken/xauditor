@@ -34,6 +34,7 @@ import type {
   UserListResponse,
   UserSummary,
 } from "./types";
+import { serializeFiltersToQueryString } from "./findings-filters";
 
 export class ApiError extends Error {
   status: number;
@@ -130,7 +131,20 @@ export const api = {
     mode?: "fast" | "deep";
     project?: string;
   } = {}) => request<RunsPage>(`/api/runs${toQueryString(params)}`),
-  getRun: (runId: string) => request<RunDetail>(`/api/runs/${runId}`),
+  getRun: (runId: string, filters?: FindingFilters) => {
+    // Use `serializeFiltersToQueryString` (NOT `toQueryString`) so the
+    // run-detail endpoint receives the same three-state ``coder_status``
+    // marker the findings-list endpoint understands:
+    //   - filters.coder_status undefined → no param → server applies default
+    //   - filters.coder_status === []    → ?coder_status=   → no restriction
+    //   - filters.coder_status === [...] → repeated params → verbatim
+    // This keeps the run-detail header tile in lockstep with the findings
+    // list as the operator toggles chips.
+    const qs = filters ? serializeFiltersToQueryString(filters) : "";
+    return request<RunDetail>(
+      qs ? `/api/runs/${runId}?${qs}` : `/api/runs/${runId}`,
+    );
+  },
   cancelRun: (runId: string, reason?: string | null) =>
     request<RunDetail>(`/api/runs/${runId}/cancel`, {
       method: "POST",
@@ -323,10 +337,14 @@ export function useRuns(params: Parameters<typeof api.listRuns>[0] = {}) {
   });
 }
 
-export function useRun(runId: string) {
+export function useRun(runId: string, filters?: FindingFilters) {
   return useQuery({
-    queryKey: ["run", runId],
-    queryFn: () => api.getRun(runId),
+    // Include the filter object in the queryKey so toggling coder chips
+    // re-fetches with the new ``coder_status`` selection. React Query
+    // serializes objects with stable key ordering so identical filter
+    // states cache-hit, distinct ones miss.
+    queryKey: ["run", runId, filters ?? null],
+    queryFn: () => api.getRun(runId, filters),
     refetchInterval: (query) => {
       const run = query.state.data;
       return run && run.status === "in_progress" ? 3000 : false;

@@ -91,12 +91,12 @@ describe("FilterBar", () => {
     await user.click(screen.getByRole("button", { name: /reset/i }));
     // Reset returns Validation to the FP-excluding default and Coder
     // verification to its default subset (every status except Not
-    // Verified). The other three multi-selects clear to no selection
-    // (omitted from the object).
+    // Verified AND Fail). The other three multi-selects clear to no
+    // selection (omitted from the object).
     const last = onChange.mock.calls.at(-1)?.[0];
     expect(last).toEqual({
       validation_status: ["Valid", "Partial Valid", "Inconclusive"],
-      coder_status: ["Verified", "Inconclusive", "Fail", "Pending", "Skipped"],
+      coder_status: ["Verified", "Inconclusive", "Pending", "Skipped"],
     });
   });
 
@@ -128,7 +128,7 @@ describe("FilterBar", () => {
   it("Coder verification chip group renders all six canonical statuses", async () => {
     const user = userEvent.setup();
     make({
-      coder_status: ["Verified", "Inconclusive", "Fail", "Pending", "Skipped"],
+      coder_status: ["Verified", "Inconclusive", "Pending", "Skipped"],
     });
     await user.click(
       screen.getByRole("button", { name: /^Coder verification:/i }),

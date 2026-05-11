@@ -7,7 +7,9 @@
 // Two filters have a default-checked subset:
 // - `validation_status` defaults to `[Valid, Partial Valid, Inconclusive]`
 //   (hides `False Positive`).
-// - `coder_status` defaults to every status except `Not Verified`.
+// - `coder_status` defaults to `[Verified, Inconclusive, Pending, Skipped]`
+//   (hides `Not Verified` AND `Fail` — failed coder verifications are usually
+//   coder-microservice transport issues, not actionable findings).
 // In both cases, an absent URL key yields the default; a present-but-empty
 // key (e.g. `?coder_status=`) is the operator's "I unchecked everything"
 // marker and suppresses the default on reload.
@@ -23,7 +25,6 @@ export const VALIDATION_DEFAULT = [
 export const CODER_STATUS_DEFAULT = [
   "Verified",
   "Inconclusive",
-  "Fail",
   "Pending",
   "Skipped",
 ] as const;
@@ -63,6 +64,26 @@ export function parseFiltersFromSearchParams(
     }
   }
   return out;
+}
+
+// Parse the search params AND apply the per-dimension default-checked
+// subsets for any dimension whose URL key is absent. Centralizes the
+// "absent key → apply default, present key (incl. empty marker) → honor
+// verbatim" rule so the run-detail page and the FindingsView agree on
+// what's active. Mirrors the logic that used to live inline in
+// `FindingsView`'s `useState` initializer.
+export function parseFiltersWithDefaults(
+  sp: URLSearchParams | { has: (k: string) => boolean; get: (k: string) => string | null; getAll: (k: string) => string[] },
+): FindingFilters {
+  const parsed = parseFiltersFromSearchParams(sp);
+  const next: FindingFilters = { ...parsed };
+  if (!sp.has("validation_status")) {
+    next.validation_status = [...VALIDATION_DEFAULT];
+  }
+  if (!sp.has("coder_status")) {
+    next.coder_status = [...CODER_STATUS_DEFAULT];
+  }
+  return next;
 }
 
 export function serializeFiltersToQueryString(filters: FindingFilters): string {

@@ -96,10 +96,10 @@ describe("findings-filters URL plumbing", () => {
     expect(reparsed.coder_status).toEqual([...CODER_STATUS_DEFAULT]);
   });
 
-  it("CODER_STATUS_DEFAULT excludes only Not Verified", () => {
+  it("CODER_STATUS_DEFAULT excludes Not Verified AND Fail", () => {
     expect([...CODER_STATUS_DEFAULT].sort()).toEqual(
       [...CODER_STATUS_OPTIONS]
-        .filter((s) => s !== "Not Verified")
+        .filter((s) => s !== "Not Verified" && s !== "Fail")
         .sort(),
     );
   });

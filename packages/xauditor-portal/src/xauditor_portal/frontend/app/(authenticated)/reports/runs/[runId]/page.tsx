@@ -3,7 +3,7 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { ArrowLeft, Ban, CheckCircle2, Trash2 } from "lucide-react";
 import Link from "next/link";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import * as React from "react";
 import { Breadcrumbs } from "@/components/breadcrumbs";
 import { ConfirmActionDialog } from "@/components/confirm-action-dialog";
@@ -17,6 +17,7 @@ import { ModeChip, StagesFormChip, StatusChip } from "@/components/status-chip";
 import { ProgressBar } from "@/components/progress-bar";
 import { cn, formatTimestamp } from "@/lib/utils";
 import { ApiError, api, useMe, useProjects, useRun } from "@/lib/api";
+import { parseFiltersWithDefaults } from "@/lib/findings-filters";
 import type { FeedbackBreakdown, RunDetail, RunsPage } from "@/lib/types";
 
 const FP_METRIC_TOOLTIP =
@@ -35,7 +36,17 @@ export default function RunDetailPage({
 }: {
   params: { runId: string };
 }) {
-  const { data: run, isLoading, error } = useRun(params.runId);
+  // Derive filter state from the URL on every render. ``FindingsView``
+  // owns the writable copy and pushes URL updates via ``router.replace``;
+  // ``useSearchParams()`` here observes those URL changes so the header
+  // metric tiles re-fetch and stay in lockstep with the findings list as
+  // the operator toggles chips.
+  const searchParams = useSearchParams();
+  const filters = React.useMemo(
+    () => parseFiltersWithDefaults(searchParams),
+    [searchParams],
+  );
+  const { data: run, isLoading, error } = useRun(params.runId, filters);
   const [tab, setTab] = React.useState<SubTab>("findings");
   const { data: me } = useMe();
   const isAdmin = me?.role === "admin";

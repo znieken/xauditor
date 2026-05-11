@@ -7,9 +7,7 @@ import { EmptyState } from "@/components/ui/empty-state";
 import { FilterBar } from "@/components/filter-bar";
 import { FindingCard } from "@/components/finding-card";
 import {
-  CODER_STATUS_DEFAULT,
-  VALIDATION_DEFAULT,
-  parseFiltersFromSearchParams,
+  parseFiltersWithDefaults,
   serializeFiltersToQueryString,
 } from "@/lib/findings-filters";
 import type { FindingFilters } from "@/lib/types";
@@ -34,17 +32,9 @@ export function FindingsView({
   // default when the key is absent entirely; honor any URL-encoded value
   // (including the empty marker `?validation_status=`/`?coder_status=`)
   // verbatim — see spec.
-  const [filters, setFilters] = React.useState<FindingFilters>(() => {
-    const parsed = parseFiltersFromSearchParams(searchParams);
-    const next: FindingFilters = { ...parsed };
-    if (!searchParams.has("validation_status")) {
-      next.validation_status = [...VALIDATION_DEFAULT];
-    }
-    if (!searchParams.has("coder_status")) {
-      next.coder_status = [...CODER_STATUS_DEFAULT];
-    }
-    return next;
-  });
+  const [filters, setFilters] = React.useState<FindingFilters>(() =>
+    parseFiltersWithDefaults(searchParams),
+  );
 
   // Sync the chosen filter state back to the URL. The first effect run
   // materializes the FP-excluding default via replaceState (no history
