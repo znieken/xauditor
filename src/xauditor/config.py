@@ -510,7 +510,18 @@ class AuditReplicationConfig:
     Default (`1, 1, 1`) is fast-mode behaviour. Deep mode resolves to
     `(3, 3, 1)` — three analyzer / validator replicas with personas
     diversifying their attention; one exploiter (constructive stage,
-    no value in fanning out)."""
+    no value in fanning out).
+
+    ``exploiter == 0`` is the documented "skip the exploiter stage
+    for the whole run" sentinel: the workflow records the existing
+    `ExploitationResult(status="skipped", ...)` placeholder for every
+    validator-surviving finding instead of invoking the agent / team.
+    The ``not_exploitable → Partial Valid`` downgrade path becomes
+    unreachable in this mode (its precondition is
+    `exploitation.status == "not_exploitable"`, which never holds
+    when the stage is skipped). ``analyzer`` and ``validator`` keep
+    a strict positive lower bound — those stages produce / vet the
+    finding and cannot be disabled this way."""
 
     analyzer: int = 1
     validator: int = 1
@@ -1224,7 +1235,9 @@ def _build_audit_mode_config(
         exploiter=_normalize_bounded_int(
             replication_raw.get("exploiter", preset["replication"]["exploiter"]),
             field_name="audit.replication.exploiter",
-            minimum=1,
+            # 0 = skip the exploiter stage for the whole run. See
+            # ``AuditReplicationConfig.exploiter`` docstring.
+            minimum=0,
             maximum=20,
         ),
     )

@@ -10,7 +10,7 @@ from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from pydantic import BaseModel, Field
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -98,6 +98,12 @@ _DEFAULT_CODER_FILTER: tuple[str, ...] = (
     "Skipped",
 )
 
+# Default validation-status subset applied when the caller does not supply
+# an explicit ``validation_status`` query param. Matches the Findings filter
+# bar's first-open subset — hides ``False Positive`` so the visible row set
+# is the "review queue" rather than every agent verdict.
+_DEFAULT_VALIDATION_FILTER: tuple[str, ...] = _VALID_STATUSES
+
 
 @dataclass(frozen=True)
 class _RunMetrics:
@@ -136,35 +142,80 @@ def _zero_metrics() -> _RunMetrics:
     )
 
 
-def _resolve_coder_filter(
-    coder_status_filter: Sequence[str] | None,
+def _resolve_filter(
+    values: Sequence[str] | None,
+    *,
+    default: tuple[str, ...] | None,
 ) -> tuple[str, ...] | None:
-    """Translate the three-state caller input into a SQL-ready tuple.
+    """Translate three-state caller input into a SQL-ready tuple.
 
-    ``None`` → apply the server default ``_DEFAULT_CODER_FILTER``.
-    Empty sequence → ``None`` (no restriction; the operator unchecked everything).
+    ``None`` (caller did not supply the param) → apply the dimension's
+    server-side default (may itself be ``None`` for dimensions that have no
+    default and pass-through "no filter").
+    Empty sequence (operator unchecked every chip) → ``None`` (no
+    restriction; the empty-marker semantics from the findings endpoint).
     Non-empty sequence → the values verbatim.
     """
 
-    if coder_status_filter is None:
-        return _DEFAULT_CODER_FILTER
-    values = tuple(coder_status_filter)
-    if not values:
+    if values is None:
+        return default
+    cleaned = tuple(v for v in values if v != "")
+    if not cleaned:
         return None
-    return values
+    return cleaned
+
+
+def _resolve_coder_filter(
+    coder_status_filter: Sequence[str] | None,
+) -> tuple[str, ...] | None:
+    """Compatibility wrapper kept for the coder-status default semantics."""
+
+    return _resolve_filter(coder_status_filter, default=_DEFAULT_CODER_FILTER)
+
+
+@dataclass(frozen=True)
+class _MetricsFilters:
+    """All filter dimensions the metrics pivot honors.
+
+    Mirrors the ``GET /api/runs/{run_id}/findings`` signature so the
+    run-detail header tiles and the row list agree on what's in-scope. Every
+    dimension passed in is applied as a SQL ``WHERE`` clause on the pivot;
+    each COUNT FILTER (``base_valid``, ``false_positives_count``, …) then
+    aggregates within the resulting set.
+
+    For run-list endpoints (no filter UI) the helper is called with all
+    fields at their defaults — for ``validation_status`` and ``coder_status``
+    that means the corresponding ``_DEFAULT_*_FILTER`` tuple is applied; for
+    the other dimensions the pivot adds no WHERE clause and counts every
+    finding in the run.
+    """
+
+    file: str | None = None
+    function: str | None = None
+    confidence: Sequence[str] | None = None
+    validation_status: Sequence[str] | None = None
+    exploitation_status: Sequence[str] | None = None
+    feedback_label: Sequence[str] | None = None
+    coder_status: Sequence[str] | None = None
+    q: str | None = None
 
 
 def _build_metrics_select(
     *group_columns,
-    coder_status_filter: Sequence[str] | None = None,
+    filters: _MetricsFilters | None = None,
 ):
     """Shared SELECT pivot used by both the per-run and batched helpers.
 
-    ``coder_status_filter`` follows the three-state convention documented on
-    ``_resolve_coder_filter``. When the resolved filter is non-None, the
-    pivot adds a ``WHERE COALESCE(coder_finding.status, 'Skipped') IN (...)``
-    clause so every COUNT FILTER below sees only the in-scope finding set.
+    ``filters`` carries every filter dimension the Findings filter bar can
+    set. Each non-None list field follows the three-state convention from
+    ``_resolve_filter``; substring/text fields are applied verbatim when
+    truthy. The result is a single SELECT whose COUNT FILTER aggregates
+    operate against the post-WHERE finding set, so the run-detail header
+    tiles reflect exactly the row set that ``GET /api/runs/{id}/findings``
+    would return under the same filter combination.
     """
+
+    f = filters or _MetricsFilters()
 
     is_valid = Finding.validation_status.in_(_VALID_STATUSES)
     label = FindingAnnotation.label
@@ -202,10 +253,41 @@ def _build_metrics_select(
             & (CoderFinding.finding_ref == Finding.finding_id),
         )
     )
-    resolved = _resolve_coder_filter(coder_status_filter)
-    if resolved is not None:
+
+    if f.file:
+        stmt = stmt.where(Finding.file_path.ilike(f"%{f.file}%"))
+    if f.function:
+        stmt = stmt.where(Finding.function_name.ilike(f"%{f.function}%"))
+    confidence = _resolve_filter(f.confidence, default=None)
+    if confidence is not None:
+        stmt = stmt.where(Finding.confidence_level.in_(confidence))
+    validation = _resolve_filter(
+        f.validation_status, default=_DEFAULT_VALIDATION_FILTER
+    )
+    if validation is not None:
+        stmt = stmt.where(Finding.validation_status.in_(validation))
+    exploitation = _resolve_filter(f.exploitation_status, default=None)
+    if exploitation is not None:
+        stmt = stmt.where(Finding.exploitation_status.in_(exploitation))
+    feedback = _resolve_filter(f.feedback_label, default=None)
+    if feedback is not None:
         stmt = stmt.where(
-            func.coalesce(CoderFinding.status, "Skipped").in_(resolved)
+            func.coalesce(FindingAnnotation.label, _LABEL_UNLABELED).in_(feedback)
+        )
+    coder = _resolve_filter(f.coder_status, default=_DEFAULT_CODER_FILTER)
+    if coder is not None:
+        stmt = stmt.where(
+            func.coalesce(CoderFinding.status, "Skipped").in_(coder)
+        )
+    if f.q:
+        like = f"%{f.q}%"
+        stmt = stmt.where(
+            or_(
+                Finding.finding_name.ilike(like),
+                Finding.finding_description.ilike(like),
+                Finding.analysis.ilike(like),
+                Finding.reason.ilike(like),
+            )
         )
     return stmt
 
@@ -254,7 +336,7 @@ def _row_to_metrics(row) -> _RunMetrics:
 async def _run_metrics(
     session: AsyncSession,
     run_id: str,
-    coder_status_filter: Sequence[str] | None = None,
+    filters: _MetricsFilters | None = None,
 ) -> _RunMetrics:
     """Compute every live count for one run in a single SQL round-trip.
 
@@ -262,17 +344,19 @@ async def _run_metrics(
     against ``report.findings`` and pivots the valid-side base + adjustment
     counts, the feedback-derived ``false_positives_count`` (annotations whose
     label is ``false_positive``), and the duplicate / unlabeled / total
-    counts. ``coder_status_filter`` is forwarded to ``_build_metrics_select``;
-    see ``_resolve_coder_filter`` for the three-state semantics. The
-    ``feedback.finding_annotations`` UNIQUE on (run_id, finding_id) and the
-    ``coder_findings`` UNIQUE on (run_id, finding_ref) both keep the joins
-    row-equivalent to per-finding lookups, so no de-duplication is needed in
-    the COUNT FILTERs. Cost scales with findings-per-run.
+    counts. ``filters`` carries every filter dimension the Findings filter
+    bar can set; the pivot applies them as WHERE clauses so the resulting
+    counts match what ``GET /api/runs/{id}/findings`` would return under the
+    same filter combination. The ``feedback.finding_annotations`` UNIQUE on
+    (run_id, finding_id) and the ``coder_findings`` UNIQUE on
+    (run_id, finding_ref) keep the joins row-equivalent to per-finding
+    lookups, so no de-duplication is needed in the COUNT FILTERs. Cost
+    scales with findings-per-run.
     """
 
     row = (
         await session.execute(
-            _build_metrics_select(coder_status_filter=coder_status_filter).where(
+            _build_metrics_select(filters=filters).where(
                 Finding.run_id == run_id
             )
         )
@@ -283,16 +367,16 @@ async def _run_metrics(
 async def _batch_run_metrics(
     session: AsyncSession,
     run_ids: Sequence[str],
-    coder_status_filter: Sequence[str] | None = None,
+    filters: _MetricsFilters | None = None,
 ) -> dict[str, _RunMetrics]:
     """Same SQL as ``_run_metrics`` but pivoted per ``run_id`` via GROUP BY.
 
     Used by the list endpoints so the page of N runs costs one round-trip
-    instead of N. Runs whose finding set is empty (no rows in
-    ``report.findings``) won't appear in the result; callers fill the gap
-    with ``_zero_metrics()``. ``coder_status_filter`` is forwarded to
-    ``_build_metrics_select``; the list endpoints pass ``None`` so the
-    server-side default ``_DEFAULT_CODER_FILTER`` applies.
+    instead of N. Runs whose finding set is empty under the active filter
+    (or absent from ``report.findings`` entirely) won't appear in the
+    result; callers fill the gap with ``_zero_metrics()``. The list
+    endpoints pass ``None`` so server-side defaults apply for
+    ``validation_status`` and ``coder_status``.
     """
 
     if not run_ids:
@@ -302,7 +386,7 @@ async def _batch_run_metrics(
         await session.execute(
             _build_metrics_select(
                 Finding.run_id.label("run_id"),
-                coder_status_filter=coder_status_filter,
+                filters=filters,
             )
             .where(Finding.run_id.in_(run_ids))
             .group_by(Finding.run_id)
@@ -383,23 +467,22 @@ async def _load_run(session: AsyncSession, run_id: str) -> AuditRun:
     return row
 
 
-def _parse_coder_status_query(
-    coder_status: list[str] | None,
-) -> Sequence[str] | None:
-    """Translate the FastAPI query value into ``_run_metrics`` semantics.
+def _parse_list_query(values: list[str] | None) -> Sequence[str] | None:
+    """Translate a repeatable list query param into ``_resolve_filter`` input.
 
     The portal serializes filter state as repeatable query params; an
     operator who unchecks every chip sends the present-but-empty marker
-    ``?coder_status=``, which FastAPI surfaces as ``[""]``. Distinguish:
+    (e.g. ``?coder_status=``), which FastAPI surfaces as ``[""]``. The
+    three states the metrics pivot honors:
 
     - Missing entirely (``None``) → return ``None`` (helper applies default)
-    - Present with at least one non-empty value → return the filtered list
+    - Present with at least one non-empty value → return the cleaned list
     - Present with only empty strings → return ``()`` (no restriction)
     """
 
-    if coder_status is None:
+    if values is None:
         return None
-    cleaned = [v for v in coder_status if v != ""]
+    cleaned = [v for v in values if v != ""]
     if cleaned:
         return cleaned
     return ()
@@ -409,13 +492,39 @@ def _parse_coder_status_query(
 async def get_run(
     run_id: str,
     session: AsyncSession = Depends(get_session),
+    file: str | None = Query(default=None),
+    function: str | None = Query(default=None),
+    confidence: list[str] | None = Query(default=None),
+    validation_status: list[str] | None = Query(default=None),
+    exploitation_status: list[str] | None = Query(default=None),
+    feedback_label: list[str] | None = Query(default=None),
     coder_status: list[str] | None = Query(default=None),
+    q: str | None = Query(default=None, description="Free-text substring search"),
 ) -> RunDetail:
+    """Run-detail endpoint.
+
+    Accepts the same filter dimensions as ``GET /api/runs/{id}/findings``
+    so the header metric tiles stay in lockstep with the row list as the
+    operator toggles chips. Filter dimensions that ``validation_status``
+    and ``coder_status`` carry default-checked subsets — see
+    ``_DEFAULT_VALIDATION_FILTER`` and ``_DEFAULT_CODER_FILTER``; the other
+    dimensions default to "no filter" when their query param is absent.
+    """
+
     row = await _load_run(session, run_id)
     metrics = await _run_metrics(
         session,
         run_id,
-        coder_status_filter=_parse_coder_status_query(coder_status),
+        filters=_MetricsFilters(
+            file=file,
+            function=function,
+            confidence=_parse_list_query(confidence),
+            validation_status=_parse_list_query(validation_status),
+            exploitation_status=_parse_list_query(exploitation_status),
+            feedback_label=_parse_list_query(feedback_label),
+            coder_status=_parse_list_query(coder_status),
+            q=q,
+        ),
     )
     return await _build_run_detail(session, row, metrics)
 
