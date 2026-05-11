@@ -534,17 +534,10 @@ class CanonicalGraphTransformer:
                 truncation_reason = path.reason
                 truncation_cap = path.cap
                 continue
-            if enrichment_enabled:
-                business_context, trust_boundary = self._summarize_path(path)
-                path = PathRecord(
-                    entry_function=path.entry_function,
-                    function_names=path.function_names,
-                    file_paths=path.file_paths,
-                    path_fingerprint=path.path_fingerprint,
-                    function_ids=path.function_ids,
-                    business_context=business_context,
-                    trust_boundary=trust_boundary,
-                )
+            # Path-level business_context / trust_boundary were
+            # previously LLM-generated here; ``drop-summarize-path-llm-call``
+            # removed that. Paths persist with the empty strings the
+            # canonical PathRecord carries from upstream.
             path_chunk.append(path)
             path_records.append(path)
             if len(path_chunk) >= chunk_size:
@@ -717,18 +710,6 @@ class CanonicalGraphTransformer:
                 stack.append(next_id)
                 visited.add(next_id)
                 iter_stack.append(iter(outgoing_sorted.get(next_id, ())))
-
-    def _summarize_path(self, path: PathRecord) -> tuple[str, str]:
-        if self.llm_client is not None:
-            enrichment = self.llm_client.summarize_path(path.entry_function, path.function_names)
-            return enrichment["business_context"], enrichment["trust_boundary"]
-        joined = " -> ".join(path.function_names)
-        trust_boundary = (
-            "crosses external input"
-            if any("handler" in name.lower() or "request" in name.lower() for name in path.function_names)
-            else "internal flow"
-        )
-        return f"Path from {path.entry_function} through {joined}.", trust_boundary
 
     def _build_coverage(
         self,

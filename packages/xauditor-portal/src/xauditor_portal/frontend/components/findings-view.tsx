@@ -7,6 +7,7 @@ import { EmptyState } from "@/components/ui/empty-state";
 import { FilterBar } from "@/components/filter-bar";
 import { FindingCard } from "@/components/finding-card";
 import {
+  CODER_STATUS_DEFAULT,
   VALIDATION_DEFAULT,
   parseFiltersFromSearchParams,
   serializeFiltersToQueryString,
@@ -28,17 +29,21 @@ export function FindingsView({
   const pathname = usePathname();
   const searchParams = useSearchParams();
 
-  // Initial filter state: parse the URL once. If no validation_status param
-  // is present (key absent entirely), apply the FP-excluding default and
-  // materialize it into the URL via replaceState so the page is reload-stable.
-  // If the URL already encodes validation_status (including the empty marker
-  // `?validation_status=`), honor it verbatim — see spec.
+  // Initial filter state: parse the URL once. For dimensions with a
+  // default-checked subset (validation_status, coder_status), apply the
+  // default when the key is absent entirely; honor any URL-encoded value
+  // (including the empty marker `?validation_status=`/`?coder_status=`)
+  // verbatim — see spec.
   const [filters, setFilters] = React.useState<FindingFilters>(() => {
     const parsed = parseFiltersFromSearchParams(searchParams);
+    const next: FindingFilters = { ...parsed };
     if (!searchParams.has("validation_status")) {
-      return { ...parsed, validation_status: [...VALIDATION_DEFAULT] };
+      next.validation_status = [...VALIDATION_DEFAULT];
     }
-    return parsed;
+    if (!searchParams.has("coder_status")) {
+      next.coder_status = [...CODER_STATUS_DEFAULT];
+    }
+    return next;
   });
 
   // Sync the chosen filter state back to the URL. The first effect run

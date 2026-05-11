@@ -211,13 +211,6 @@ export function FindingCard({
                   {detail.data.context}
                 </p>
               </Section>
-              {detail.data.business_context ? (
-                <Section title="Business context">
-                  <p className="whitespace-pre-wrap leading-relaxed">
-                    {detail.data.business_context}
-                  </p>
-                </Section>
-              ) : null}
               {detail.data.context_notes ? (
                 <Section title="Context notes">
                   <p className="whitespace-pre-wrap leading-relaxed">

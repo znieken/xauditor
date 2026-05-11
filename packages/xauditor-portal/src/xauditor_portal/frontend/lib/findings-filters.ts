@@ -1,15 +1,16 @@
 // URL ↔ FindingFilters plumbing for the run findings page.
 //
-// The four enumerated-value filters (`confidence`, `validation_status`,
-// `exploitation_status`, `feedback_label`) round-trip as repeated query
-// parameters: `?validation_status=Valid&validation_status=Inconclusive`.
+// The five enumerated-value filters (`confidence`, `validation_status`,
+// `exploitation_status`, `feedback_label`, `coder_status`) round-trip as
+// repeated query parameters: `?validation_status=Valid&validation_status=Inconclusive`.
 //
-// The `validation_status` filter has one extra wrinkle for the FP-excluding
-// default: when the URL contains no `validation_status` key at all, the page
-// applies the default `[Valid, Partial Valid, Inconclusive]`. When the URL
-// contains the key, even with an empty value (`?validation_status=`), the
-// URL wins and the default is suppressed. The empty marker is what the user
-// gets when they uncheck every Validation option themselves.
+// Two filters have a default-checked subset:
+// - `validation_status` defaults to `[Valid, Partial Valid, Inconclusive]`
+//   (hides `False Positive`).
+// - `coder_status` defaults to every status except `Not Verified`.
+// In both cases, an absent URL key yields the default; a present-but-empty
+// key (e.g. `?coder_status=`) is the operator's "I unchecked everything"
+// marker and suppresses the default on reload.
 
 import type { FeedbackLabel, FindingFilters } from "@/lib/types";
 
@@ -19,11 +20,29 @@ export const VALIDATION_DEFAULT = [
   "Inconclusive",
 ] as const;
 
+export const CODER_STATUS_DEFAULT = [
+  "Verified",
+  "Inconclusive",
+  "Fail",
+  "Pending",
+  "Skipped",
+] as const;
+
+export const CODER_STATUS_OPTIONS = [
+  "Verified",
+  "Not Verified",
+  "Inconclusive",
+  "Skipped",
+  "Pending",
+  "Fail",
+] as const;
+
 const ARRAY_KEYS = [
   "confidence",
   "validation_status",
   "exploitation_status",
   "feedback_label",
+  "coder_status",
 ] as const;
 const SCALAR_KEYS = ["file", "function", "q"] as const;
 
@@ -56,11 +75,14 @@ export function serializeFiltersToQueryString(filters: FindingFilters): string {
     const v = readArrayKey(filters, k);
     if (v === undefined) continue;
     if (v.length === 0) {
-      // For validation_status, the empty marker `?validation_status=` tells
-      // the parser "user has explicitly cleared this filter, do NOT apply
-      // the FP-excluding default on the next render." For the other three
-      // arrays there is no default to suppress, so we just omit the key.
-      if (k === "validation_status") sp.append(k, "");
+      // For dimensions with a default-checked subset (validation_status,
+      // coder_status), the empty marker tells the parser "user has
+      // explicitly cleared this filter, do NOT apply the default on the
+      // next render." For the other three arrays there is no default to
+      // suppress, so we just omit the key.
+      if (k === "validation_status" || k === "coder_status") {
+        sp.append(k, "");
+      }
       continue;
     }
     for (const item of v) sp.append(k, item);

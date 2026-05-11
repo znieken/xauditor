@@ -86,7 +86,6 @@ async def feedback_export(
                 "analysis": _redact(finding.analysis),
                 "reason": _redact(finding.reason),
                 "context": _redact(finding.context),
-                "business_context": _redact(finding.business_context),
                 "context_notes": _redact(finding.context_notes) if finding.context_notes else None,
                 "suspect_function_id": finding.suspect_function_id,
                 "suspect_line": finding.suspect_line,

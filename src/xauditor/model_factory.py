@@ -30,7 +30,6 @@ from xauditor.prompts import (
     EXPLOITATION_PROMPT,
     FINDING_SUMMARY_PROMPT,
     FUNCTION_SUMMARY_PROMPT,
-    PATH_SUMMARY_PROMPT,
     VALIDATOR_DEBATE_PROMPT,
     VALIDATOR_PROMPT,
 )
@@ -196,16 +195,6 @@ def _mock_response(system: str, user: dict[str, Any]) -> dict[str, Any]:
         return {
             "summary": f"{class_name} in {file_path} coordinates class behavior.",
             "business_context": f"{class_name} owns class-scoped members for repository behavior.",
-        }
-    if system == PATH_SUMMARY_PROMPT:
-        entry_function = str(user.get("entry_function", "entry"))
-        function_names = tuple(str(item) for item in user.get("function_names", ()))
-        joined = " -> ".join(function_names)
-        return {
-            "business_context": f"Path from {entry_function} through {joined}.",
-            "trust_boundary": "crosses external input"
-            if any("handler" in name or "request" in name for name in function_names)
-            else "internal flow",
         }
     if system == ANALYZER_PROMPT:
         definitions = user.get("function_definitions", ()) or user.get("path_functions", ())

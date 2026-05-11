@@ -2,11 +2,8 @@
 
 Drives ``AuditGraphSource.iter_paths(page_size=batch_size)`` from a
 single background thread, materialises each ``PathRecord`` into an
-``AuditUnit`` (calling ``LLMClient.summarize_path`` to backfill
-``business_context`` / ``trust_boundary`` when the graph row is
-missing them — same body as the eager ``plan_audit_paths``), dedupes
-by ``path_fingerprint``, and pushes the result onto a bounded
-``queue.Queue`` of capacity ``batch_size``.
+``AuditUnit``, dedupes by ``path_fingerprint``, and pushes the
+result onto a bounded ``queue.Queue`` of capacity ``batch_size``.
 
 The audit workflow consumes one ``AuditUnit`` at a time via
 ``next_or_none``; the bounded queue is the natural backpressure that
@@ -30,7 +27,6 @@ from xauditor.models import AuditUnit, PathRecord
 
 if TYPE_CHECKING:
     from xauditor.audit.source import AuditGraphSource
-    from xauditor.llm import LLMClient
 
 
 _END = object()
@@ -50,14 +46,12 @@ class PathStreamer:
         source: "AuditGraphSource",
         *,
         batch_size: int,
-        llm_client: "LLMClient | None" = None,
         dedup: bool = True,
     ) -> None:
         if batch_size < 1:
             raise ValueError(f"batch_size must be >= 1, got {batch_size!r}")
         self._source = source
         self._batch_size = batch_size
-        self._llm_client = llm_client
         self._dedup = dedup
         self._queue: queue.Queue = queue.Queue(maxsize=batch_size)
         self._stop_event = threading.Event()
@@ -177,24 +171,11 @@ class PathStreamer:
         self._safe_put(_END)
 
     def _build_unit(self, path: PathRecord) -> AuditUnit:
-        business_context = path.business_context
-        trust_boundary = path.trust_boundary
-        if self._llm_client is not None and (not business_context or not trust_boundary):
-            enrichment = self._llm_client.summarize_path(
-                path.entry_function, path.function_names
-            )
-            business_context = business_context or enrichment["business_context"]
-            trust_boundary = trust_boundary or enrichment["trust_boundary"]
+        # Path business_context / trust_boundary flow through verbatim;
+        # the previous LLM fallback was removed by
+        # ``drop-summarize-path-llm-call``.
         return AuditUnit(
-            path=PathRecord(
-                entry_function=path.entry_function,
-                function_names=path.function_names,
-                file_paths=path.file_paths,
-                path_fingerprint=path.path_fingerprint,
-                function_ids=path.function_ids,
-                business_context=business_context,
-                trust_boundary=trust_boundary,
-            ),
+            path=path,
             function_ids=path.function_ids,
         )
 

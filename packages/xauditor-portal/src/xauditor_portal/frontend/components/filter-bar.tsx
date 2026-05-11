@@ -5,7 +5,11 @@ import * as React from "react";
 import { Button } from "@/components/ui/button";
 import { Input, Label } from "@/components/ui/input";
 import { MultiSelect } from "@/components/ui/multi-select";
-import { VALIDATION_DEFAULT } from "@/lib/findings-filters";
+import {
+  CODER_STATUS_DEFAULT,
+  CODER_STATUS_OPTIONS,
+  VALIDATION_DEFAULT,
+} from "@/lib/findings-filters";
 import type { FeedbackLabel, FindingFilters } from "@/lib/types";
 
 const CONFIDENCE_OPTIONS = [
@@ -34,6 +38,11 @@ const FEEDBACK_OPTIONS: { value: FeedbackLabel; label: string }[] = [
   { value: "unlabeled", label: "Unlabeled" },
 ];
 
+const CODER_STATUS_CHIP_OPTIONS = CODER_STATUS_OPTIONS.map((value) => ({
+  value,
+  label: value,
+}));
+
 export function FilterBar({
   value,
   onChange,
@@ -56,16 +65,22 @@ export function FilterBar({
   }
 
   function setArray(
-    key: "confidence" | "validation_status" | "exploitation_status",
+    key:
+      | "confidence"
+      | "validation_status"
+      | "exploitation_status"
+      | "coder_status",
     v: string[],
   ) {
     const next = { ...value };
-    // For validation_status, an empty array is meaningful (the "user
-    // explicitly cleared it" marker the URL serializer encodes as
-    // `?validation_status=`). For the other two arrays, drop the key
-    // entirely on empty so the URL stays tidy.
-    if (key === "validation_status") {
-      next.validation_status = v;
+    // For dimensions with a default-checked subset (validation_status,
+    // coder_status), an empty array is meaningful — the "user
+    // explicitly cleared it" marker that serializes to
+    // `?validation_status=` / `?coder_status=` and tells the parser
+    // to suppress the default on reload. For the other arrays, drop
+    // the key entirely on empty so the URL stays tidy.
+    if (key === "validation_status" || key === "coder_status") {
+      next[key] = v;
     } else if (v.length === 0) {
       delete next[key];
     } else {
@@ -82,12 +97,15 @@ export function FilterBar({
   }
 
   function reset() {
-    onChange({ validation_status: [...VALIDATION_DEFAULT] });
+    onChange({
+      validation_status: [...VALIDATION_DEFAULT],
+      coder_status: [...CODER_STATUS_DEFAULT],
+    });
   }
 
   return (
     <div className="flex flex-col gap-3 rounded-xl border border-zinc-200 bg-white/70 p-4 dark:border-zinc-800 dark:bg-zinc-900/40">
-      <div className="grid grid-cols-1 gap-3 md:grid-cols-3 lg:grid-cols-6">
+      <div className="grid grid-cols-1 gap-3 md:grid-cols-3 lg:grid-cols-7">
         <div className="space-y-1">
           <Label htmlFor="filter-file">File</Label>
           <Input
@@ -144,6 +162,16 @@ export function FilterBar({
             options={FEEDBACK_OPTIONS}
             value={value.feedback_label ?? []}
             onChange={(v) => setFeedback(v as FeedbackLabel[])}
+          />
+        </div>
+        <div className="space-y-1">
+          <Label htmlFor="filter-coder-status">Coder verification</Label>
+          <MultiSelect
+            id="filter-coder-status"
+            label="Coder verification"
+            options={CODER_STATUS_CHIP_OPTIONS}
+            value={value.coder_status ?? []}
+            onChange={(v) => setArray("coder_status", v)}
           />
         </div>
       </div>

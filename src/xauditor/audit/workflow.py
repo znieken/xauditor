@@ -52,7 +52,6 @@ from xauditor.models import (
     AuditUnit,
     ConfidenceLevel,
     Finding,
-    PathRecord,
     SourceReference,
     ValidationStatus,
 )
@@ -966,7 +965,7 @@ class AuditWorkflow:
                     entry_function=candidate_unit.path.entry_function,
                     functions=candidate_unit.path.function_names,
                 )
-            unit = self._enrich_unit(candidate_unit)
+            unit = candidate_unit
             path_functions = source.load_path_functions(unit.function_ids)
             module_symbols, function_symbol_uses = source.load_path_symbols(unit.function_ids)
             # Phase 2A: build a `GraphSlice` and project to the legacy
@@ -1763,44 +1762,6 @@ class AuditWorkflow:
                 for turn in debate.turns
             ],
         }
-
-    def _enrich_unit(self, unit: AuditUnit) -> AuditUnit:
-        if unit.path.business_context and unit.path.trust_boundary:
-            if self.logger is not None:
-                self.logger.debug_kv(
-                    "Path enrichment skipped",
-                    path=unit.path.path_fingerprint,
-                    business_context=unit.path.business_context,
-                    trust_boundary=unit.path.trust_boundary,
-                )
-            return unit
-        if self.logger is not None:
-            self.logger.debug_kv(
-                "Path enrichment request",
-                path=unit.path.path_fingerprint,
-                entry_function=unit.path.entry_function,
-                functions=unit.path.function_names,
-            )
-        enrichment = self.llm_client.summarize_path(unit.path.entry_function, unit.path.function_names)
-        if self.logger is not None:
-            self.logger.debug_kv(
-                "Path enrichment response",
-                path=unit.path.path_fingerprint,
-                business_context=enrichment["business_context"],
-                trust_boundary=enrichment["trust_boundary"],
-            )
-        return AuditUnit(
-            path=PathRecord(
-                entry_function=unit.path.entry_function,
-                function_names=unit.path.function_names,
-                file_paths=unit.path.file_paths,
-                path_fingerprint=unit.path.path_fingerprint,
-                function_ids=unit.path.function_ids,
-                business_context=enrichment["business_context"],
-                trust_boundary=enrichment["trust_boundary"],
-            ),
-            function_ids=unit.function_ids,
-        )
 
     def _build_finding(self, *, index: int, unit, path_functions, analyzer, exploitation, validator, referenced_symbols=(), agentic_transcript: tuple[dict[str, object], ...] = ()):
         if analyzer.status != "candidate":

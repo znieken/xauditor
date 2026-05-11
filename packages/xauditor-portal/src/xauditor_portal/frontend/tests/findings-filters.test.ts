@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
+  CODER_STATUS_DEFAULT,
+  CODER_STATUS_OPTIONS,
   VALIDATION_DEFAULT,
   parseFiltersFromSearchParams,
   serializeFiltersToQueryString,
@@ -65,5 +67,40 @@ describe("findings-filters URL plumbing", () => {
     const qs = serializeFiltersToQueryString(filters);
     const reparsed = parseFiltersFromSearchParams(new URLSearchParams(qs));
     expect(reparsed.validation_status).toEqual([...VALIDATION_DEFAULT]);
+  });
+
+  it("emits the empty marker `?coder_status=` when the array is empty", () => {
+    // Mirrors the validation_status empty-marker behaviour: the operator
+    // explicitly cleared every chip, the URL records that intent so a
+    // reload doesn't snap back to the default.
+    const qs = serializeFiltersToQueryString({ coder_status: [] });
+    expect(qs).toBe("coder_status=");
+  });
+
+  it("treats `?coder_status=` as an explicit empty array on parse", () => {
+    const sp = new URLSearchParams("?coder_status=");
+    const filters = parseFiltersFromSearchParams(sp);
+    expect(filters.coder_status).toEqual([]);
+  });
+
+  it("omits absent coder_status entirely so the page can apply its default", () => {
+    const sp = new URLSearchParams("?file=auth");
+    const filters = parseFiltersFromSearchParams(sp);
+    expect("coder_status" in filters).toBe(false);
+  });
+
+  it("round-trips the coder_status default subset", () => {
+    const filters = { coder_status: [...CODER_STATUS_DEFAULT] };
+    const qs = serializeFiltersToQueryString(filters);
+    const reparsed = parseFiltersFromSearchParams(new URLSearchParams(qs));
+    expect(reparsed.coder_status).toEqual([...CODER_STATUS_DEFAULT]);
+  });
+
+  it("CODER_STATUS_DEFAULT excludes only Not Verified", () => {
+    expect([...CODER_STATUS_DEFAULT].sort()).toEqual(
+      [...CODER_STATUS_OPTIONS]
+        .filter((s) => s !== "Not Verified")
+        .sort(),
+    );
   });
 });

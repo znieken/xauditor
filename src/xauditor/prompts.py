@@ -54,16 +54,6 @@ _PROMPT_REGISTRY: dict[str, dict[str, str]] = {
             '"business_context": "<business or repository role>"}.'
         ),
     },
-    "path_summary": {
-        "v1": "Summarize a code path for security auditing.",
-        "v2": (
-            "You are generating security-research context for a concrete repository path. "
-            "Describe the business purpose and trust-boundary transitions of this path using concise, source-backed language suitable for later PSIRT review. "
-            "Prefer bounded claims, call out uncertainty, and do not invent exploitability conclusions. "
-            'Return only a JSON object with exactly these keys: {"business_context": "<path purpose>", '
-            '"trust_boundary": "<boundary description>"}.'
-        ),
-    },
     "analyzer": {
         "v1": "Analyze a single path for security issues using path-sensitive source evidence.",
         "v2": (
@@ -374,10 +364,6 @@ CLASS_SUMMARY_PROMPT_SPEC = get_prompt_definition("class_summary")
 CLASS_SUMMARY_PROMPT = CLASS_SUMMARY_PROMPT_SPEC.system
 CLASS_SUMMARY_PROMPT_VERSION = CLASS_SUMMARY_PROMPT_SPEC.version
 
-PATH_SUMMARY_PROMPT_SPEC = get_prompt_definition("path_summary")
-PATH_SUMMARY_PROMPT = PATH_SUMMARY_PROMPT_SPEC.system
-PATH_SUMMARY_PROMPT_VERSION = PATH_SUMMARY_PROMPT_SPEC.version
-
 ANALYZER_PROMPT_SPEC = get_prompt_definition("analyzer")
 ANALYZER_PROMPT = ANALYZER_PROMPT_SPEC.system
 ANALYZER_PROMPT_VERSION = ANALYZER_PROMPT_SPEC.version
@@ -422,9 +408,6 @@ __all__ = [
     "CLASS_SUMMARY_PROMPT_SPEC",
     "CLASS_SUMMARY_PROMPT",
     "CLASS_SUMMARY_PROMPT_VERSION",
-    "PATH_SUMMARY_PROMPT_SPEC",
-    "PATH_SUMMARY_PROMPT",
-    "PATH_SUMMARY_PROMPT_VERSION",
     "ANALYZER_PROMPT_SPEC",
     "ANALYZER_PROMPT",
     "ANALYZER_PROMPT_VERSION",

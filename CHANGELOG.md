@@ -8,6 +8,117 @@ package (`xauditor-coder-service`) tracks its own version inside
 
 ## [Unreleased]
 
+`drop-summarize-path-llm-call`: graph build no longer issues
+per-path `summarize_path` LLM calls.
+
+- **xauditor**: `LLMClient.summarize_path` and the
+  `path_summary` prompt template are deleted. The canonical
+  graph transformer no longer enriches `Path.business_context`
+  / `Path.trust_boundary` — new builds persist empty strings
+  there. Three audit-time fallback call sites
+  (`audit/streamer.py`, `audit/planner.py`,
+  `audit/workflow.py:_enrich_unit`) are removed; the
+  `PathStreamer` constructor drops its `llm_client` parameter.
+- **xauditor-portal**: the "Business context" `<Section>` on
+  the expanded finding card is deleted.
+  `FindingDetail.business_context` is removed from the
+  `GET /api/findings/{id}` response, the TypeScript type, and
+  the feedback-export JSONL payload. **The Postgres column
+  `report.findings.business_context` and the sink writer
+  stay** — historical data and direct DB queries are
+  unaffected.
+- **Behaviour change**: API consumers reading
+  `FindingDetail.business_context` will see the field absent.
+  Finding cards stop rendering the section.
+- **No audit-quality impact**: analyzer / validator /
+  exploiter prompts never read these fields.
+- **Cost win**: saves N×LLM round-trips per graph build,
+  significant on large repos (especially paired with the
+  recent `paths_max_count: 0` default).
+
+`portal-coder-status-filter`: the findings filter bar gains a
+**Coder verification** multi-select chip group with one option per
+canonical `coder_status` value (`Verified` / `Not Verified` /
+`Inconclusive` / `Skipped` / `Pending` / `Fail`).
+
+- **Default-checked subset**: every status except `Not Verified` is
+  checked on first open. Operators see the full review queue (real
+  candidates, ambiguous verdicts, infrastructure failures, in-flight
+  work, and skipped paths) and can uncheck what they don't want.
+- **URL round-trip**: a new repeatable `coder_status` query param
+  serializes the chip group; an empty marker (`?coder_status=`) is
+  the operator's "I unchecked everything" state and suppresses the
+  default on reload, mirroring `validation_status` semantics.
+- **Server-side filter**: `GET /api/runs/{run_id}/findings` accepts
+  a repeatable `coder_status` query param and applies it as
+  `WHERE COALESCE(coder_status, 'Skipped') IN (...)` on the primary
+  findings query (joined with `coder_findings`), so pagination is
+  honest under any selection. Findings with no coder row surface
+  as `Skipped` and are filterable as such.
+- **Reset behaviour**: the FilterBar reset button now restores
+  both `validation_status` and `coder_status` to their respective
+  defaults (`Valid` / `Partial Valid` / `Inconclusive` and every
+  coder status except `Not Verified`).
+- **Behaviour change**: pre-existing bookmarks without a
+  `coder_status` query param now hide `Not Verified` rows by
+  default. Check the `Not Verified` chip or click Reset to see
+  every row.
+
+`audit-stream-path-loading`: replace the eager
+"materialise every path then submit every future" audit-run model with
+a bounded-memory streaming pipeline; remove the build-time path-count
+default cap.
+
+- **New knob**: `audit.path_batch_size: int = 2000` (yaml +
+  `XAUDITOR_AUDIT_PATH_BATCH_SIZE` env override + portal Audit
+  Settings tab). Bounded `[1, 100000]`. Sets BOTH the in-memory
+  window of the audit-run path streamer AND the Neo4j cursor
+  `page_size` used by `iter_path_records`. Default brings peak
+  master memory on a 50k-path build down by an order of magnitude
+  and pushes time-to-first-finding from minutes to seconds.
+- **New module**: `xauditor.audit.streamer.PathStreamer` —
+  background fetcher thread + bounded `queue.Queue(maxsize=
+  path_batch_size)`. The bounded queue is the prefetch
+  threshold: `queue.put(block=True)` resumes the moment a worker
+  consumes a slot, so Neo4j round-trip latency overlaps with LLM
+  work. ``EagerPathStreamer`` is the in-memory adapter that
+  preserves the `workflow.run(plan=...)` legacy entry for tests.
+- **Behavior change**: `graph.build.paths_max_count` default
+  flips from `50000` to `0`; `0` (or any non-positive value)
+  means "no cap; enumerate every reachable path". Bounds widen
+  to `[0, ∞)`; negatives still raise `ConfigError`. The field
+  still participates in the build fingerprint, so cap changes
+  invalidate cached builds — operators see a one-time graph
+  rebuild on first build after the upgrade. Operators who want
+  the old behavior can pin `paths_max_count: 50000` in yaml.
+- **Determinism preserved**: paths still walked in
+  `path_fingerprint` order; `Finding.finding_id` assignments are
+  byte-for-byte identical across every value of
+  `audit.path_batch_size` and every value of
+  `audit.worker_count` (covered by
+  `tests/test_audit_workflow_streaming.py`).
+
+`short-circuit-validator-fp`: the validator's `False Positive` verdict
+is now the canonical short-circuit point for the rest of the per-finding
+pipeline AND defaults to dropping FP rows from the report stores.
+
+- **Coder dispatch is suppressed on validator FP** (single mode and
+  teaming mode) regardless of `coder.enabled`. The finding is emitted
+  with `coder_status: "Skipped"` — same shape as a `coder.enabled =
+  false` run. The exploiter skip on FP (already in place) is unchanged.
+- **New knob**: `audit.persist_false_positives: bool = False` (yaml +
+  `XAUDITOR_AUDIT_PERSIST_FALSE_POSITIVES` env override + portal Audit
+  Settings toggle). When `false` (the default), FP findings stay in the
+  in-memory snapshot (so coverage and per-stage counts remain accurate)
+  but are NOT upserted into the reportdb sink, included in the Neo4j
+  `persist_audit_run` payload, or rendered into `false-positives.md`
+  (the artifact is emitted with only its header and an explanatory
+  note pointing at the knob).
+- **Behavior change**: FP findings no longer persisted by default — set
+  `audit.persist_false_positives: true` to restore the prior behavior of
+  keeping FP rows queryable from reportdb / Neo4j. Pre-existing FP rows
+  in either store are untouched; only new runs stop inserting them.
+
 `migrate-provider-list-to-audit-namespace` (Phase 1B of
 `restructure-audit-modes-and-coverage`): per-stage provider rotation
 moves from the legacy `teaming.<stage>.provider_list` location to the

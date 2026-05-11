@@ -28,11 +28,6 @@ if PYDANTIC_AVAILABLE:  # pragma: no cover - optional dependency path
         business_context: str
 
 
-    class PathSummaryOutput(_PydanticBaseModel):
-        business_context: str
-        trust_boundary: str
-
-
     def _coerce_steps_to_string(value):
         if isinstance(value, str):
             return value
@@ -209,12 +204,6 @@ else:
 
 
     @dataclass(frozen=True)
-    class PathSummaryOutput(_CompatModel):
-        business_context: str
-        trust_boundary: str
-
-
-    @dataclass(frozen=True)
     class AnalyzerOutput(_CompatModel):
         status: str
         finding_name: str = ""
@@ -271,7 +260,6 @@ __all__ = [
     "FunctionSummaryOutput",
     "OutputValidationError",
     "PYDANTIC_AVAILABLE",
-    "PathSummaryOutput",
     "ReconcilerOutput",
     "ValidationOutput",
     "ValidatorDebateOutput",

@@ -321,7 +321,20 @@ Opening a run reveals three sub-tabs:
 - **Findings** — filterable list of finding cards (collapsed by
   default; expand to see every field plus syntax-highlighted source
   snippets, referenced symbols, exploitation steps, validation
-  analysis, and the feedback control). For deep-mode runs the
+  analysis, and the feedback control). The filter bar exposes
+  multi-select chip groups for **Confidence**, **Validation**,
+  **Exploitation**, **Feedback**, and **Coder verification**. The
+  last two carry default-checked subsets so first-open shows the
+  actionable review queue: **Validation** defaults to `Valid` /
+  `Partial Valid` / `Inconclusive` (hides `False Positive`);
+  **Coder verification** defaults to every status except
+  `Not Verified` (so `Verified` / `Inconclusive` / `Fail` /
+  `Pending` / `Skipped` are visible by default). The filters
+  round-trip through repeatable URL query params; an empty marker
+  (`?coder_status=`) suppresses the default on reload, which is
+  what an operator gets when they explicitly uncheck every chip.
+  Reset restores both default subsets in one click. For deep-mode
+  runs the
   expanded body also includes a **Validator debate** section
   rendered inline as a `<details>` element (folded by default);
   expanding it shows the full per-round transcript — final verdict,

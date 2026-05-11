@@ -39,7 +39,7 @@ describe("FilterBar", () => {
     make();
     expect(screen.getByLabelText(/file/i)).toBeInTheDocument();
     expect(screen.getByLabelText(/function/i)).toBeInTheDocument();
-    // The four enum filters render as multi-select trigger buttons whose
+    // The five enum filters render as multi-select trigger buttons whose
     // aria-label embeds the current selection summary, so we match the
     // prefix of the label rather than the exact text.
     expect(
@@ -53,6 +53,9 @@ describe("FilterBar", () => {
     ).toBeInTheDocument();
     expect(
       screen.getByRole("button", { name: /^Feedback:/i }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: /^Coder verification:/i }),
     ).toBeInTheDocument();
     expect(screen.getByLabelText(/search/i)).toBeInTheDocument();
   });
@@ -86,11 +89,14 @@ describe("FilterBar", () => {
     expect(onCollapseAll).toHaveBeenCalledTimes(1);
 
     await user.click(screen.getByRole("button", { name: /reset/i }));
-    // Reset returns Validation to the FP-excluding default; the other
-    // three multi-selects clear to no selection (omitted from the object).
+    // Reset returns Validation to the FP-excluding default and Coder
+    // verification to its default subset (every status except Not
+    // Verified). The other three multi-selects clear to no selection
+    // (omitted from the object).
     const last = onChange.mock.calls.at(-1)?.[0];
     expect(last).toEqual({
       validation_status: ["Valid", "Partial Valid", "Inconclusive"],
+      coder_status: ["Verified", "Inconclusive", "Fail", "Pending", "Skipped"],
     });
   });
 
@@ -117,5 +123,44 @@ describe("FilterBar", () => {
     // ?validation_status= as the "user cleared this filter" marker
     // (suppresses the FP-excluding default on next render).
     expect(last.validation_status).toEqual([]);
+  });
+
+  it("Coder verification chip group renders all six canonical statuses", async () => {
+    const user = userEvent.setup();
+    make({
+      coder_status: ["Verified", "Inconclusive", "Fail", "Pending", "Skipped"],
+    });
+    await user.click(
+      screen.getByRole("button", { name: /^Coder verification:/i }),
+    );
+    const popover = screen.getByRole("listbox", {
+      name: /coder verification/i,
+    });
+    for (const label of [
+      "Verified",
+      "Not Verified",
+      "Inconclusive",
+      "Skipped",
+      "Pending",
+      "Fail",
+    ]) {
+      expect(within(popover).getByText(label)).toBeInTheDocument();
+    }
+  });
+
+  it("clearing every Coder verification option emits an empty array (URL marker)", async () => {
+    const user = userEvent.setup();
+    const { onChange } = make({ coder_status: ["Verified"] });
+    await user.click(
+      screen.getByRole("button", { name: /^Coder verification:/i }),
+    );
+    const popover = screen.getByRole("listbox", {
+      name: /coder verification/i,
+    });
+    await user.click(within(popover).getByText("Verified"));
+    const last = onChange.mock.calls.at(-1)?.[0];
+    // Empty array marker so reload doesn't snap back to the
+    // CODER_STATUS_DEFAULT subset.
+    expect(last.coder_status).toEqual([]);
   });
 });

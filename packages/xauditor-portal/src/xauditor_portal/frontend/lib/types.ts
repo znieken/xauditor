@@ -232,7 +232,6 @@ export interface FindingDetail extends FindingSummary {
   analysis: string;
   reason: string;
   context: string;
-  business_context: string;
   context_notes: string | null;
   exploitation_steps: string;
   validation_analysis: string;
@@ -325,6 +324,7 @@ export interface FindingFilters {
   validation_status?: string[];
   exploitation_status?: string[];
   feedback_label?: FeedbackLabel[];
+  coder_status?: string[];
   q?: string;
 }
 

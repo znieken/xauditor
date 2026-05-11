@@ -17,13 +17,11 @@ from xauditor.llm_outputs import (
     ClassSummaryOutput,
     FunctionSummaryOutput,
     OutputValidationError,
-    PathSummaryOutput,
 )
 from xauditor.model_factory import ChatModel, build_chat_model
 from xauditor.prompts import (
     CLASS_SUMMARY_PROMPT_SPEC,
     FUNCTION_SUMMARY_PROMPT_SPEC,
-    PATH_SUMMARY_PROMPT_SPEC,
 )
 from xauditor.resilience import retry
 from xauditor.runtime_logging import RuntimeLogger
@@ -142,54 +140,6 @@ class LLMClient:
                 "LLM summarize_class response",
                 summary=result["summary"],
                 business_context=result["business_context"],
-            )
-        return result
-
-    def summarize_path(self, entry_function: str, function_names: tuple[str, ...]) -> dict[str, str]:
-        joined = " -> ".join(function_names)
-        if self.logger is not None:
-            self.logger.debug_kv(
-                "LLM summarize_path request",
-                mode="mock" if self.model.is_mock else "shared-model",
-                entry_function=entry_function,
-                prompt_version=PATH_SUMMARY_PROMPT_SPEC.version,
-                function_count=len(function_names),
-            )
-        trust_boundary = (
-            "crosses external input"
-            if any("handler" in name or "request" in name for name in function_names)
-            else "internal flow"
-        )
-        fallback_result = {
-            "business_context": f"Path from {entry_function} through {joined}.",
-            "trust_boundary": trust_boundary,
-        }
-        if self.model.is_mock:
-            result = fallback_result
-            if self.logger is not None:
-                self.logger.debug_kv(
-                    "LLM summarize_path response",
-                    business_context=result["business_context"],
-                    trust_boundary=result["trust_boundary"],
-                )
-            return result
-        payload = self._invoke_json(
-            system=PATH_SUMMARY_PROMPT_SPEC.system,
-            user={"entry_function": entry_function, "function_names": function_names},
-            operation="summarize_path",
-            prompt_version=PATH_SUMMARY_PROMPT_SPEC.version,
-            response_model=PathSummaryOutput,
-            fallback_result=fallback_result,
-        )
-        result = {
-            "business_context": str(payload["business_context"]),
-            "trust_boundary": str(payload["trust_boundary"]),
-        }
-        if self.logger is not None:
-            self.logger.debug_kv(
-                "LLM summarize_path response",
-                business_context=result["business_context"],
-                trust_boundary=result["trust_boundary"],
             )
         return result
 

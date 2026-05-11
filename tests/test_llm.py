@@ -16,29 +16,16 @@ from xauditor.prompts import (
     CLASS_SUMMARY_PROMPT_VERSION,
     FUNCTION_SUMMARY_PROMPT,
     FUNCTION_SUMMARY_PROMPT_VERSION,
-    PATH_SUMMARY_PROMPT,
-    PATH_SUMMARY_PROMPT_VERSION,
     get_prompt_definition,
 )
 from xauditor.runtime_logging import RuntimeLogger
 
 
 class LLMLoggingTests(unittest.TestCase):
-    def test_mock_summarize_path_emits_debug_logs(self) -> None:
-        stream = io.StringIO()
-        logger = RuntimeLogger(level="debug", stream=stream, redactions=("secret-key",))
-        client = LLMClient(
-            config=LLMConfig(base_url="mock://offline", api_key="secret-key", model_name="mock-model"),
-            logger=logger,
-        )
-
-        client.summarize_path("handler", ("handler", "helper", "run_ls"))
-
-        rendered = stream.getvalue()
-        self.assertIn("LLM summarize_path request", rendered)
-        self.assertIn("mode=mock", rendered)
-        self.assertIn("LLM summarize_path response", rendered)
-        self.assertNotIn("secret-key", rendered)
+    def test_summarize_path_method_is_gone(self) -> None:
+        # ``drop-summarize-path-llm-call`` removed the per-path
+        # enrichment call. Catch any regression that re-adds it.
+        self.assertFalse(hasattr(LLMClient, "summarize_path"))
 
     def test_http_summarize_function_emits_request_and_response_summaries(self) -> None:
         stream = io.StringIO()
@@ -172,11 +159,6 @@ class LLMLoggingTests(unittest.TestCase):
                     "summary": "Class summary",
                     "business_context": "Class context",
                 }
-            if "function_names" in user:
-                return {
-                    "business_context": "Path context",
-                    "trust_boundary": "internal flow",
-                }
             return {"summary": "Function summary"}
 
         with patch.object(client.model, "invoke_json", side_effect=fake_invoke_json):
@@ -188,14 +170,12 @@ class LLMLoggingTests(unittest.TestCase):
                 method_names=("run",),
                 member_names=("DEFAULT_CMD",),
             )
-            path_summary = client.summarize_path("handler", ("handler", "run_ls"))
 
         self.assertEqual(function_summary, "Function summary")
         self.assertEqual(class_summary["summary"], "Class summary")
-        self.assertEqual(path_summary["trust_boundary"], "internal flow")
         self.assertEqual(
             seen_system_prompts,
-            [FUNCTION_SUMMARY_PROMPT, CLASS_SUMMARY_PROMPT, PATH_SUMMARY_PROMPT],
+            [FUNCTION_SUMMARY_PROMPT, CLASS_SUMMARY_PROMPT],
         )
 
     def test_prompt_registry_exposes_versioned_prompt_selection(self) -> None:
@@ -207,7 +187,6 @@ class LLMLoggingTests(unittest.TestCase):
         self.assertEqual(legacy_prompt.version, "v1")
         self.assertNotEqual(default_prompt.system, legacy_prompt.system)
         self.assertEqual(get_prompt_definition("class_summary").version, CLASS_SUMMARY_PROMPT_VERSION)
-        self.assertEqual(get_prompt_definition("path_summary").version, PATH_SUMMARY_PROMPT_VERSION)
 
 
 if __name__ == "__main__":

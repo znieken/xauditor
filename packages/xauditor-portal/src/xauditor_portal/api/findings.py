@@ -7,7 +7,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from pydantic import BaseModel, Field
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from xauditor_portal.auth import (
@@ -60,7 +60,6 @@ class FindingDetail(FindingSummary):
     analysis: str
     reason: str
     context: str
-    business_context: str
     context_notes: str | None
     exploitation_steps: str
     validation_analysis: str
@@ -177,6 +176,7 @@ async def list_run_findings(
     validation_status: list[str] | None = Query(default=None),
     exploitation_status: list[str] | None = Query(default=None),
     feedback_label: list[str] | None = Query(default=None),
+    coder_status: list[str] | None = Query(default=None),
     q: str | None = Query(default=None, description="Free-text substring search"),
     limit: int = Query(default=200, ge=1, le=1000),
     offset: int = Query(default=0, ge=0),
@@ -184,7 +184,24 @@ async def list_run_findings(
     run = await session.get(AuditRun, run_id)
     if run is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Audit run not found.")
-    query = select(Finding).where(Finding.run_id == run_id)
+    # Join the coder verdict onto every finding so the per-finding chip
+    # renders without a second round-trip AND ``coder_status`` becomes a
+    # WHERE-able expression alongside the other filters. Findings without
+    # a ``CoderFinding`` row (validator-FP path or ``coder.enabled=false``)
+    # surface as ``Skipped`` via ``coalesce`` — same value as the legacy
+    # post-query enrichment used to imply.
+    coder_status_col = func.coalesce(CoderFinding.status, "Skipped").label(
+        "coder_status"
+    )
+    query = (
+        select(Finding, coder_status_col)
+        .outerjoin(
+            CoderFinding,
+            (CoderFinding.run_id == Finding.run_id)
+            & (CoderFinding.finding_ref == Finding.finding_id),
+        )
+        .where(Finding.run_id == run_id)
+    )
     if file:
         query = query.where(Finding.file_path.ilike(f"%{file}%"))
     if function:
@@ -195,6 +212,10 @@ async def list_run_findings(
         query = query.where(Finding.validation_status.in_(validation_status))
     if exploitation_status:
         query = query.where(Finding.exploitation_status.in_(exploitation_status))
+    if coder_status:
+        query = query.where(
+            func.coalesce(CoderFinding.status, "Skipped").in_(coder_status)
+        )
     if q:
         like = f"%{q}%"
         query = query.where(
@@ -206,7 +227,11 @@ async def list_run_findings(
             )
         )
     query = query.order_by(Finding.created_at.asc()).offset(offset).limit(limit)
-    findings = (await session.execute(query)).scalars().all()
+    rows = (await session.execute(query)).all()
+    findings = [row[0] for row in rows]
+    coder_status_by_finding_ref: dict[str, str] = {
+        row[0].finding_id: row[1] for row in rows
+    }
     # Fetch annotations for all findings in one go.
     annotations = {
         a.finding_id: a.label
@@ -230,20 +255,6 @@ async def list_run_findings(
                 await session.execute(
                     select(ValidatorDebate.finding_ref).where(
                         ValidatorDebate.run_id == run_id
-                    )
-                )
-            ).all()
-        }
-    # Fetch coder verdicts for this run in one go so the collapsed-card
-    # chip renders without a per-finding round-trip.
-    coder_status_by_finding_ref: dict[str, str] = {}
-    if findings:
-        coder_status_by_finding_ref = {
-            finding_ref: status
-            for finding_ref, status in (
-                await session.execute(
-                    select(CoderFinding.finding_ref, CoderFinding.status).where(
-                        CoderFinding.run_id == run_id
                     )
                 )
             ).all()
@@ -334,7 +345,6 @@ async def get_finding(
         analysis=finding.analysis,
         reason=finding.reason,
         context=finding.context,
-        business_context=finding.business_context,
         context_notes=finding.context_notes,
         exploitation_steps=finding.exploitation_steps,
         validation_analysis=finding.validation_analysis,

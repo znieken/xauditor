@@ -34,7 +34,6 @@ function detailPayload(overrides: Partial<FindingDetail> = {}): FindingDetail {
     analysis: "Analysis prose",
     reason: "Reason prose",
     context: "Context prose",
-    business_context: "",
     context_notes: null,
     exploitation_steps: "",
     validation_analysis: "Validation analysis prose",

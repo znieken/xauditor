@@ -11,8 +11,7 @@ from xauditor.audit.units import (
     as_audit_unit,
 )
 from xauditor.config import AuditModeConfig
-from xauditor.llm import LLMClient
-from xauditor.models import AuditPlan, AuditUnit, FunctionRecord, PathRecord
+from xauditor.models import AuditPlan, AuditUnit, FunctionRecord
 
 
 _ENTRY_INTENTS: frozenset[str] = frozenset({"route", "task_handler", "cli_entry"})
@@ -29,8 +28,6 @@ _STATE_MIN_MUTATING_METHODS: int = 2
 def enumerate_units(
     source: AuditGraphSource,
     audit_mode: AuditModeConfig | None = None,
-    *,
-    llm_client: LLMClient | None = None,
 ) -> list[ProtocolAuditUnit]:
     """Return the list of audit units the workflow will iterate.
 
@@ -47,7 +44,7 @@ def enumerate_units(
     follow the same gating pattern in subsequent changes.
     """
 
-    plan = plan_audit_paths(source, llm_client)
+    plan = plan_audit_paths(source)
     units: list[ProtocolAuditUnit] = [as_audit_unit(unit) for unit in plan.audit_units]
 
     units_flag_on = bool(
@@ -270,7 +267,6 @@ def stream_audit_units(
     source: AuditGraphSource,
     *,
     batch_size: int,
-    llm_client: LLMClient | None = None,
 ) -> PathStreamer:
     """Open a ``PathStreamer`` over ``source`` and return it.
 
@@ -284,40 +280,28 @@ def stream_audit_units(
     enumerators it drives).
     """
 
-    streamer = PathStreamer(source, batch_size=batch_size, llm_client=llm_client)
+    streamer = PathStreamer(source, batch_size=batch_size)
     streamer.open()
     return streamer
 
 
-def plan_audit_paths(
-    source: AuditGraphSource,
-    llm_client: LLMClient | None = None,
-) -> AuditPlan:
+def plan_audit_paths(source: AuditGraphSource) -> AuditPlan:
+    """Eagerly enumerate paths into an ``AuditPlan``.
+
+    Used by ``plan_protocol_audit_units`` and sink/boundary
+    enumerators. Path ``business_context`` / ``trust_boundary``
+    values flow through from the underlying ``PathRecord`` verbatim;
+    the previous ``summarize_path`` LLM fallback was removed by
+    ``drop-summarize-path-llm-call``.
+    """
+
     audit_units: list[AuditUnit] = []
     seen_fingerprints: set[str] = set()
     for path in source.iter_paths():
         if path.path_fingerprint in seen_fingerprints:
             continue
         seen_fingerprints.add(path.path_fingerprint)
-        function_ids = path.function_ids
-        business_context = path.business_context
-        trust_boundary = path.trust_boundary
-        if llm_client is not None and (not business_context or not trust_boundary):
-            enrichment = llm_client.summarize_path(path.entry_function, path.function_names)
-            business_context = business_context or enrichment["business_context"]
-            trust_boundary = trust_boundary or enrichment["trust_boundary"]
         audit_units.append(
-            AuditUnit(
-                path=PathRecord(
-                    entry_function=path.entry_function,
-                    function_names=path.function_names,
-                    file_paths=path.file_paths,
-                    path_fingerprint=path.path_fingerprint,
-                    function_ids=function_ids,
-                    business_context=business_context,
-                    trust_boundary=trust_boundary,
-                ),
-                function_ids=function_ids,
-            )
+            AuditUnit(path=path, function_ids=path.function_ids)
         )
     return AuditPlan(audit_units=tuple(audit_units))
